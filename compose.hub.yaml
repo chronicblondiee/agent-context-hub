@@ -1,0 +1,64 @@
+# Hub core. Run only through scripts/hub.sh, which sets the project name and every variable.
+services:
+  core:
+    image: ${HUB_IMAGE:?}
+    user: ${HUB_UID:?}:${HUB_GID:?}
+    read_only: true
+    tmpfs: ["/tmp:size=64m"]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 512m
+    cpus: 1
+    pids_limit: 128
+    restart: unless-stopped
+    # A directory without model.onnx gives explicit keyword-only retrieval (the eval baseline).
+    environment:
+      HUB_MODEL_DIR: ${HUB_MODEL_DIR:-/opt/models/minilm}
+      # Optional web UI; disabled by default.
+      HUB_UI: ${HUB_UI:-0}
+    # Empty HUB_PORT selects an ephemeral port. Bind to loopback by default.
+    ports: ["${HUB_BIND:-127.0.0.1}:${HUB_PORT:-}:8097"]
+    volumes:
+      - ${HUB_STATE:?}/data:/data:z
+      - ${HUB_STATE:?}/secrets:/secrets:ro,z
+      - ${HUB_STATE:?}/backups:/backups:z
+
+  federation:
+    profiles: [federation]
+    image: ${HUB_FEDERATION_IMAGE:-hub-public-federation}
+    user: ${HUB_UID:?}:${HUB_GID:?}
+    read_only: true
+    tmpfs: ["/tmp:size=16m"]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 128m
+    cpus: 0.5
+    pids_limit: 64
+    restart: unless-stopped
+    environment:
+      HUB_FEDERATION_PROJECT: ${HUB_FEDERATION_PROJECT:-}
+      HUB_URL: http://core:8097
+      HUB_KEY_FILE: /secrets/hub.key
+      HUB_NATS_CONFIG_FILE: /secrets/nats.json
+    volumes:
+      - ${HUB_STATE:?}/federation-secrets:/secrets:ro,z
+    depends_on:
+      core:
+        condition: service_healthy
+
+  broker:
+    profiles: [broker]
+    image: nats@sha256:777787bbb4c7c4083ec2213b0b8b14151617610a3e0d85776bd995cd46599c73
+    command: ["-c", "/etc/nats/nats.conf"]
+    user: ${HUB_UID:?}:${HUB_GID:?}
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 128m
+    cpus: 0.5
+    pids_limit: 64
+    restart: unless-stopped
+    ports: ["127.0.0.1:${HUB_NATS_PORT:-}:4222"]
+    volumes:
+      - ${HUB_STATE:?}/federation-secrets/nats.conf:/etc/nats/nats.conf:ro,z
+      - ${HUB_STATE:?}/nats-data:/data:z

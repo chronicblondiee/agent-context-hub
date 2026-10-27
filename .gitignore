@@ -1,0 +1,17 @@
+.local/
+.venv/
+__pycache__/
+.ruff_cache/
+.env
+.env.*
+!.env.example
+.hub.json
+.mcp.json
+.claude/
+data/
+secrets/
+backups/
+*.key
+*.pem
+*.sqlite3*
+*.tar.gz

@@ -1,0 +1,28 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${PLUGIN_ROOT}/bin/hub\" hook",
+            "timeout": 6,
+            "additionalContextLimit": 5000
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"${PLUGIN_ROOT}/bin/hub\" hook",
+            "timeout": 6,
+            "additionalContextLimit": 5000
+          }
+        ]
+      }
+    ]
+  }
+}

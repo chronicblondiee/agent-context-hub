@@ -1,0 +1,14 @@
+{
+  "name": "agent-context-hub",
+  "owner": {
+    "name": "Agent Context Hub"
+  },
+  "plugins": [
+    {
+      "name": "hub",
+      "source": "./plugins/hub",
+      "version": "0.2.11",
+      "description": "Shared hub troubleshooting"
+    }
+  ]
+}

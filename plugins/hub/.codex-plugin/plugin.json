@@ -1,0 +1,10 @@
+{
+  "name": "hub",
+  "version": "0.2.11",
+  "description": "Shared evidence-led troubleshooting with Agent Context Hub",
+  "author": {
+    "name": "Agent Context Hub"
+  },
+  "skills": "./skills/",
+  "hooks": "./hooks/codex.json"
+}

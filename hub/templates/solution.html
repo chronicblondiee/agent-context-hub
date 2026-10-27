@@ -1,0 +1,13 @@
+<h1>Solution $solution_id</h1>
+<p><a href="/ui/p/$project">back to $project</a> · status <b>$status</b> · revision $revision · author $author</p>
+<pre>$body</pre>
+<p>commit $commit · image $image</p>
+<h2>Evidence for this revision</h2>$evidence
+<form method="post" action="$action">
+<b>Decide</b> (human maintainer key required)<br>
+<input type="hidden" name="revision" value="$revision">
+<select name="action"><option>approve</option><option>review</option><option>revoke</option></select>
+<input name="reason" placeholder="reason" required>
+<input type="password" name="key" placeholder="your hub key" autocomplete="off" required>
+<button>Submit</button>
+</form>

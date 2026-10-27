@@ -1,0 +1,9 @@
+<h1>Record $record_id</h1>
+<p><a href="/ui/p/$project">back to $project</a></p>
+<pre>$body</pre>
+$fields
+<form method="post" action="$action">
+<b>Revoke this record</b> (needs ownership or maintainer; revocation is permanent and audited)<br>
+<input type="password" name="key" placeholder="your hub key" autocomplete="off" required>
+<button>Revoke</button>
+</form>
