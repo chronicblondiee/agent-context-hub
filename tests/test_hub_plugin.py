@@ -444,6 +444,69 @@ sys.exit(code)
         self.assertEqual(second.returncode, 0, second.stderr)
         self.assertEqual(json.loads(second.stdout)["predecessor"], first["id"])
 
+    def test_setup_installs_an_explicit_only_tshoot_skill_per_client(self):
+        homes = {"claude": Path(self.tmp.name) / "claude", "codex": Path(self.tmp.name) / "codex"}
+        env = dict(self.env, CLAUDE_CONFIG_DIR=str(homes["claude"]), CODEX_HOME=str(homes["codex"]))
+        for client, home in homes.items():
+            args = ("setup", "--endpoint", self.config["endpoint"], "--project", "p1")
+            done = self.cli(*args, "--auto-context", "--client", client, env=env)
+            self.assertEqual(done.returncode, 0, done.stderr)
+            skill = home / "skills/tshoot/SKILL.md"
+            text = skill.read_text()
+            self.assertIn("disable-model-invocation: true", text)
+            self.assertNotIn("{HUB_HELPER}", text)
+            self.assertIn(str(CLI.resolve()), text)
+            policy = home / "skills/tshoot/agents/openai.yaml"
+            self.assertEqual(policy.exists(), client == "codex")
+            if client == "codex":
+                self.assertIn("allow_implicit_invocation: false", policy.read_text())
+            again = self.cli(*args, "--auto-context", "--client", client, env=env)
+            self.assertEqual((again.returncode, skill.read_text()), (0, text))
+        status = json.loads(self.cli("status", env=env).stdout)
+        for client in homes:
+            self.assertEqual(status[client + "_tshoot_skill"]["state"], "current")
+        # The general skill never mentions troubleshooting; the plugin registers no tshoot skill.
+        hub_skill = (CLI.parent.parent / "skills/hub/SKILL.md").read_text()
+        self.assertNotIn("tshoot", hub_skill)
+        self.assertEqual([p.name for p in (CLI.parent.parent / "skills").iterdir()], ["hub"])
+
+    def test_tshoot_install_refuses_foreign_skills_and_reports_stale(self):
+        helper = load_cli()
+        home = Path(self.tmp.name) / "claude"
+        own = home / "skills/tshoot"
+        own.mkdir(parents=True)
+        (own / "SKILL.md").write_text("mine")
+        with patch.dict(os.environ, CLAUDE_CONFIG_DIR=str(home)):
+            self.assertEqual(helper.tshoot_state("claude"), "foreign")
+            with self.assertRaises(helper.HubError):
+                helper.install_tshoot("claude")
+            self.assertEqual((own / "SKILL.md").read_text(), "mine")
+            (own / "SKILL.md").unlink()
+            own.rmdir()
+            self.assertEqual(helper.tshoot_state("claude"), "missing")
+            helper.install_tshoot("claude")
+            self.assertEqual(helper.tshoot_state("claude"), "current")
+            changed = Path(self.tmp.name) / "source"
+            (changed / "agents").mkdir(parents=True)
+            (changed / "SKILL.md").write_text("updated {HUB_HELPER}")
+            with patch.object(helper, "TSHOOT", changed):
+                self.assertEqual(helper.tshoot_state("claude"), "stale")
+                helper.install_tshoot("claude")
+                self.assertEqual(helper.tshoot_state("claude"), "current")
+            self.assertEqual(sorted(p.name for p in (home / "skills").iterdir()), ["tshoot"])
+            # Another installed plugin copy (Claude's vs Codex's) reads the same copy as current;
+            # a copy whose rendered helper was removed by a plugin update is stale.
+            helper.install_tshoot("claude")
+            marker = own / ".hub-managed"
+            recorded = json.loads(marker.read_text())
+            other = Path(self.tmp.name) / "other-plugin-copy" / "hub"
+            other.parent.mkdir()
+            other.write_text("")
+            marker.write_text(json.dumps({**recorded, "helper": str(other)}))
+            self.assertEqual(helper.tshoot_state("claude"), "current")
+            other.unlink()
+            self.assertEqual(helper.tshoot_state("claude"), "stale")
+
     def test_setup_reuses_native_user_and_project_scopes(self):
         helper = load_cli()
         native = self.repo / "native"

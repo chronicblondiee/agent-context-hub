@@ -77,7 +77,21 @@ Setup writes non-secret `.hub.json` routing and merges MCP configuration. Review
 your client's MCP/plugin hook permissions and restart it. Automatic context reads
 are opt-in during setup; `HUB_DISABLED=1` or `HUB_NO_MEMORY=1` disables helper memory
 activity. Use a distinct `--session SESSION` for each terminal investigation.
-`hub --help` lists commands. The plugin skill explains investigation and action handling.
+`hub --help` lists commands.
+
+Troubleshooting is kept apart from the general task and memory workflow. `hub setup
+--client claude|codex` also installs a personal, explicit-only skill: `/tshoot <problem>`
+in Claude Code, `$tshoot <problem>` in Codex. Neither client loads it, or the
+troubleshooting operations, into the model's context until you invoke it; `hub status`
+reports whether the installed copy is current. It retrieves project context plus an
+optional curated general library, coordinates shared investigations and reserved
+actions, and records sourced outcomes.
+
+The general library is a dedicated project that the administrator designates with
+`POST /v2/admin/tshoot-library {"project": "ID"}` after granting readers explicitly.
+Entries reach it only when a human maintainer of both the source project and the
+library publishes a sanitized proposal (`/ui/p/PROJECT/proposals`); revising or
+revoking the source withdraws the entry.
 
 For portable archives, run `scripts/hub.sh package-cli` or
 `scripts/hub.sh package-plugin`; outputs and checksums are under `.local/`.

@@ -143,7 +143,11 @@ class McpTest(unittest.TestCase):
                 )
                 described = {t.name: t.description for t in (await client.list_tools()).tools}
                 for operation in api.OPERATIONS:  # generated, so a new operation is never hidden
-                    self.assertIn(operation + "(", described["work"])
+                    # ...except troubleshooting, kept out of default context for /tshoot.
+                    if operation.startswith("tshoot_"):
+                        self.assertNotIn(operation, described["work"])
+                    else:
+                        self.assertIn(operation + "(", described["work"])
                 self.assertIn("human_decision(task_id", described["work"])
                 self.assertIn("attempt", described["record_get"])
                 created = await client.call_tool(
@@ -183,6 +187,100 @@ class McpTest(unittest.TestCase):
                 self.assertTrue(after.is_error, after.content)
 
         asyncio.run(scenario())
+
+    def test_context_max_bytes_rest_and_mcp_propagation(self):
+        from unittest.mock import patch
+
+        from hub.work import Work
+
+        work = Work(self.s, "p1")
+        for _ in range(3):
+            work.remember(
+                "worker", "n", "fact", 'docker restart 雪🙂"\\\n' * 3, "tested", 1, ["test:bytes"]
+            )
+        identity.create_project(self.s, "root", "p2", "ungranted")
+
+        def rest(path, arguments):
+            request = urllib.request.Request(
+                self.url.removesuffix("/mcp") + "/v2/projects/p1/" + path,
+                data=json.dumps(arguments).encode(),
+                headers={
+                    "Authorization": "Bearer " + self.key["key"],
+                    "Content-Type": "application/json",
+                },
+                method="POST",
+            )
+            with urllib.request.urlopen(request) as response:
+                return json.load(response)
+
+        with patch("hub.retrieval.EMBEDDER.embed", return_value=None):
+            full = rest("context", {"query": "docker restart", "max_bytes": 65536})
+            self.assertEqual(len(full["matches"]), 3)
+            expected = {
+                **full,
+                "matches": full["matches"][:2],
+                "byte_omitted_matches": 1,
+                "truncated": True,
+            }
+            budget = len(
+                json.dumps(
+                    expected, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+                ).encode("utf-8")
+            )
+            arguments = {"query": "docker restart", "max_bytes": budget}
+            for path in ("context", "work/context_get"):
+                self.assertEqual(rest(path, arguments), expected)
+
+            async def scenario():
+                async with self.client(self.key["key"]) as client:
+                    for generic in (False, True):
+
+                        async def call(args, project="p1", generic=generic):
+                            if generic:
+                                return await client.call_tool(
+                                    "work",
+                                    {
+                                        "project_id": project,
+                                        "operation": "context_get",
+                                        "arguments": args,
+                                    },
+                                )
+                            return await client.call_tool(
+                                "context_get", {"project_id": project, **args}
+                            )
+
+                        def context(result, generic=generic):
+                            self.assertFalse(result.is_error, result.content)
+                            return (
+                                result.structured_content["result"]
+                                if generic
+                                else json.loads(result.content[0].text)
+                            )
+
+                        self.assertEqual(context(await call(arguments)), expected)
+                        legacy = context(await call({"query": "docker restart"}))
+                        self.assertNotIn("byte_omitted_matches", legacy)
+                        self.assertEqual(
+                            context(await call({"query": "docker restart", "max_bytes": None})),
+                            legacy,
+                        )
+                        self.assertEqual(
+                            context(await call({"query": "docker restart", "max_bytes": 65536})),
+                            {**legacy, "byte_omitted_matches": 0},
+                        )
+                        for invalid in (1, True, False, "1024", 1.5, 0, -1, 65537):
+                            rejected = await call({**arguments, "max_bytes": invalid})
+                            self.assertTrue(rejected.is_error, rejected.content)
+                        denied = await call(arguments, project="p2")
+                        self.assertTrue(denied.is_error, denied.content)
+                        for row in expected["matches"]:
+                            read = await client.call_tool(
+                                "record_get", {"project_id": "p1", "record_id": row["id"]}
+                            )
+                            self.assertFalse(read.is_error, read.content)
+                            self.assertEqual(json.loads(read.content[0].text)["id"], row["id"])
+
+            asyncio.run(scenario())
 
 
 if __name__ == "__main__":

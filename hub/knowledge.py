@@ -6,6 +6,7 @@ import re
 
 from hub.common import NotFound, Stale, bounded, references, uid
 from hub.index import deindex, generation, index
+from hub.library import disclosable, withdraw
 from hub.store import encoded, now_us
 
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -133,6 +134,7 @@ class Knowledge:
                     raise Stale("stale solution revision")
                 revision = expected_revision + 1
                 deindex(tx, "solution", ident)
+                withdraw(tx, self.project, ident)  # a revision needs fresh publication
                 tx.execute(
                     "UPDATE solutions SET status='unverified', current_revision=?, problem_key=? "
                     "WHERE project_id=? AND id=?",
@@ -346,6 +348,7 @@ class Knowledge:
                     [target_id, self.project, solution_id],
                 )
                 deindex(tx, "solution", solution_id)
+                withdraw(tx, self.project, solution_id)
                 status = "superseded"
             elif action == "revoke":
                 tx.execute(
@@ -353,6 +356,7 @@ class Knowledge:
                     [self.project, solution_id],
                 )
                 deindex(tx, "solution", solution_id)
+                withdraw(tx, self.project, solution_id)
                 status = "revoked"
             elif action == "approve":
                 status = self._promote(tx, solution, rev)
@@ -386,6 +390,10 @@ class Knowledge:
     def knowledge_record(self, actor, ident):
         def read(db):
             solution = self._solution(db, ident)
+            if solution and not disclosable(
+                db, self.project, ident, solution["current_revision"], actor
+            ):
+                return None
             if solution:
                 revision = self._revision(db, ident, solution["current_revision"])
                 evidence = [

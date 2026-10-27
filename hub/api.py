@@ -16,7 +16,7 @@ from typing import Annotated
 from fastapi import APIRouter, Body, Depends, Header, Request
 from fastapi.responses import JSONResponse
 
-from hub import backup, federation, identity
+from hub import backup, federation, identity, library
 from hub.common import NotFound
 from hub.identity import IDENT, KEY
 from hub.store import Conflict, Overloaded
@@ -31,6 +31,10 @@ CONTRIBUTE = frozenset({"contributor"})
 OPERATIONS = {
     "work_read": (frozenset({"reader", "contributor", "maintainer"}), False),
     "context_get": (frozenset({"reader", "contributor", "maintainer"}), False),
+    "tshoot_context": (frozenset({"reader", "contributor", "maintainer"}), False),
+    "tshoot_proposals": (frozenset({"maintainer"}), False),
+    "tshoot_publication_decide": (frozenset({"maintainer"}), True),
+    "tshoot_seed_starter": (frozenset({"maintainer"}), True),
     "boot_card": (frozenset({"reader", "contributor", "maintainer"}), False),
     "claim_messages": (CONTRIBUTE, False),
     **{
@@ -51,6 +55,7 @@ OPERATIONS = {
             "attempt_record",
             "solution_propose",
             "outcome_report",
+            "tshoot_propose",
         )
     },
     "evidence_submit": (frozenset({"verifier"}), True),
@@ -78,7 +83,12 @@ OPERATIONS.update(
         )
     }
 )
-HUMAN_ONLY = {"human_decision", "solution_decide"}
+HUMAN_ONLY = {
+    "human_decision",
+    "solution_decide",
+    "tshoot_publication_decide",
+    "tshoot_seed_starter",
+}
 SERVER_ARGS = {"actor", "maintainer"}  # supplied from the principal, never from the body
 AGENT_SESSION = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 IGNORED_ARGS = {"actor", "author"}
@@ -225,6 +235,11 @@ def context_get(project_id: str, request: Request, principal: Caller, arguments:
     return _post_operation(project_id, "context_get", request, principal, arguments, None)
 
 
+@router.post("/projects/{project_id}/tshoot/context")
+def tshoot_context(project_id: str, request: Request, principal: Caller, arguments: Json = None):
+    return _post_operation(project_id, "tshoot_context", request, principal, arguments, None)
+
+
 @router.post("/projects/{project_id}/attempts")
 def attempt_record(
     project_id: str,
@@ -311,6 +326,11 @@ def admin_project(request: Request, admin: Admin, body: Json = None):
     body = body or {}
     store = request.app.state.store
     return identity.create_project(store, admin.id, body.get("id"), body.get("name", ""))
+
+
+@router.post("/admin/tshoot-library")
+def admin_tshoot_library(request: Request, admin: Admin, body: Json = None):
+    return library.configure(request.app.state.store, admin.id, (body or {}).get("project"))
 
 
 @router.post("/admin/principals")

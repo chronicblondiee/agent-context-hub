@@ -7,6 +7,7 @@ import struct
 import threading
 
 from hub.embed import MODEL, MODEL_KEY, Embedder
+from hub.store import encoded
 
 EMBEDDER = Embedder()
 CANDIDATES = 50
@@ -32,7 +33,9 @@ ACL = """(
  OR (f.kind='solution' AND s.id IS NOT NULL AND s.current_revision=f.revision
   AND s.status NOT IN ('revoked','superseded'))
  OR (f.kind='attempt' AND a.id IS NOT NULL)
-)"""
+) AND NOT EXISTS (SELECT 1 FROM publications p WHERE p.library_project=f.project_id
+ AND p.dest_id=f.record_id AND (p.status<>'published' OR p.dest_revision<>f.revision))"""
+# A library copy is disclosed only while its publication is current (hub/library.py).
 JOINS = """
  LEFT JOIN memory_records m ON f.kind='memory' AND m.project_id=f.project_id AND m.id=f.record_id
  LEFT JOIN solutions s ON f.kind='solution' AND s.project_id=f.project_id AND s.id=f.record_id
@@ -47,7 +50,7 @@ def _words(text):
     return re.findall(r"[^\W_]+", text.lower(), re.UNICODE)
 
 
-def _lexical(con, project, owner, query):
+def _lexical(con, project, owner, query, extra=""):
     tokens = list(dict.fromkeys(_words(query)))[:32]
     terms = [t for t in tokens if t not in STOPWORDS] or tokens
     if not terms:
@@ -59,6 +62,7 @@ def _lexical(con, project, owner, query):
         + JOINS
         + " WHERE search_fts MATCH ? AND f.project_id=? AND "
         + ACL
+        + extra
         + " ORDER BY score LIMIT ?",
         [expression, project, owner, CANDIDATES],
     )
@@ -69,7 +73,7 @@ def _lexical(con, project, owner, query):
     ]
 
 
-def _semantic(con, project, owner, vector):
+def _semantic(con, project, owner, vector, extra=""):
     blob = struct.pack(f"<{MODEL['dim']}f", *vector)
     rows = con.execute(
         "SELECT f.kind, f.record_id, f.revision, "
@@ -78,6 +82,7 @@ def _semantic(con, project, owner, vector):
         + JOINS
         + " WHERE f.project_id=? AND f.model=? AND f.dim=? AND "
         + ACL
+        + extra
         + " GROUP BY f.kind, f.record_id, f.revision "
         + "HAVING distance <= ? ORDER BY distance LIMIT ?",
         [blob, project, MODEL_KEY, MODEL["dim"], owner, MAX_DISTANCE, CANDIDATES],
@@ -85,12 +90,24 @@ def _semantic(con, project, owner, vector):
     return [(r[0], r[1], int(r[2])) for r in rows]
 
 
+def _conflicts(applicability, environment):
+    return any(k in environment and environment[k] != v for k, v in applicability.items())
+
+
 def _details(db, work, kind, ident, revision, environment):
     if kind == "memory":
         record = work._memory_row(db, ident)
         if not record:
             return None
-        return {
+        published = db.execute(
+            "SELECT applicability FROM publications WHERE library_project=? AND dest_id=? "
+            "AND status='published'",
+            [work.project, ident],
+        ).fetchone()
+        applicability = json.loads(published[0]) if published else {}
+        if _conflicts(applicability, environment):
+            return None
+        item = {
             "kind": kind,
             "id": ident,
             "revision": 1,
@@ -102,9 +119,12 @@ def _details(db, work, kind, ident, revision, environment):
             "owner": record["owner"],
             "agent_session": record["agent_session"],
             "evidence": record["evidence"],
-            "applicability": {},
+            "applicability": applicability,
             "created_us": record["created_us"],
         }
+        if applicability:  # general entries carry it as publication metadata
+            item["applicability_missing"] = sorted(k for k in applicability if k not in environment)
+        return item
     if kind == "attempt":
         row = db.execute(
             "SELECT * FROM attempts WHERE project_id=? AND id=?", [work.project, ident]
@@ -128,9 +148,7 @@ def _details(db, work, kind, ident, revision, environment):
     if not solution or not rev or solution["current_revision"] != revision:
         return None
     applicability = rev["applicability"]
-    if any(
-        key in environment and environment[key] != value for key, value in applicability.items()
-    ):
+    if _conflicts(applicability, environment):
         return None
     refs = [
         r[0]
@@ -156,13 +174,28 @@ def _details(db, work, kind, ident, revision, environment):
     }
 
 
-def context(work, actor, query, task_id=None, environment=None, limit=5, max_chars=8000):
+def fit_context_bytes(result, max_bytes):
+    if max_bytes is None:
+        return result
+    result = {**result, "matches": list(result["matches"]), "byte_omitted_matches": 0}
+    while len(encoded(result).encode("utf-8")) > max_bytes:
+        if not result["matches"]:
+            raise ValueError("max_bytes too small for context envelope")
+        result["matches"].pop()
+        result["byte_omitted_matches"] += 1
+        result["truncated"] = True
+    return result
+
+
+def validate(query, limit, max_chars, max_bytes, environment):
     if not isinstance(query, str) or not query.strip() or len(query) > 2048:
         raise ValueError("query required, at most 2048 characters")
     if type(limit) is not int or not 1 <= limit <= 5:
         raise ValueError("limit must be 1 to 5")
     if type(max_chars) is not int or not 1 <= max_chars <= 8000:
         raise ValueError("max_chars must be 1 to 8000")
+    if max_bytes is not None and (type(max_bytes) is not int or not 1 <= max_bytes <= 65536):
+        raise ValueError("max_bytes must be 1 to 65536 or None")
     environment = {} if environment is None else environment
     if not isinstance(environment, dict) or not all(
         isinstance(k, str) and isinstance(v, str) for k, v in environment.items()
@@ -170,77 +203,103 @@ def context(work, actor, query, task_id=None, environment=None, limit=5, max_cha
         raise ValueError("environment must map strings to strings")
     if len(json.dumps(environment)) > 2048:
         raise ValueError("environment exceeds 2048 characters")
+    return environment
+
+
+def envelope(db, project, mode="memory_disabled"):
+    generation = db.execute(
+        "SELECT generation FROM search_generations WHERE project_id=?", [project]
+    ).fetchone()
+    return {
+        "project_id": project,
+        "corpus_revision": generation[0] if generation else 0,
+        "retrieval_mode": mode,
+        "truncated": False,
+        "matches": [],
+    }
+
+
+def ranked(db, work, owner, query, query_vector, environment, extra=""):
+    """Eligible scored matches, unordered, and whether semantic search ran."""
+    lexical = _lexical(db, work.project, owner, query, extra)
+    # The mode reports whether semantic search ran, not whether it found anything: an empty
+    # result under the distance floor is normal, a missing embedder or vector index is not.
+    semantic, ran = [], False
+    if query_vector:
+        try:
+            semantic, ran = _semantic(db, work.project, owner, query_vector, extra), True
+        except sqlite3.OperationalError:
+            pass
+    scores = {}
+    for source, rows in (("keyword", lexical), ("semantic", semantic)):
+        for rank, key in enumerate(rows, 1):
+            item = scores.setdefault(key, {"score": 0.0, "reasons": []})
+            item["score"] += 1 / (RRF_K + rank)
+            item["reasons"].append(source)
+    results = []
+    for key, rank in scores.items():
+        item = _details(db, work, *key, environment)
+        if item is not None:
+            item.update(rank)
+            if item["status"] == "verified":
+                item["reasons"].append("verified revision")
+            if item.get("applicability_missing"):
+                item["reasons"].append("applicability unknown")
+            elif item["applicability"]:
+                item["reasons"].append("applicability match")
+            results.append(item)
+    return results, ran
+
+
+def order(item):
+    """Trust, then applicability, then relevance."""
+    return (
+        item["status"] != "verified",
+        -(len(item["applicability"]) - len(item.get("applicability_missing", ()))),
+        -item["score"],
+    )
+
+
+def budget(items, max_chars, truncated):
+    """Clip summaries to one shared character budget; returns (matches, truncated)."""
+    matches, used = [], 0
+    for item in items:
+        remaining = max_chars - used
+        if remaining <= 0:
+            truncated = True
+            break
+        if len(item["summary"]) > remaining:
+            item["summary"] = item["summary"][:remaining]
+            truncated = True
+        used += len(item["summary"])
+        item.pop("score")
+        matches.append(item)
+    return matches, truncated
+
+
+def embedded(query):
+    vector = EMBEDDER.embed([query])
+    return vector[0] if vector else None
+
+
+def context(
+    work, actor, query, task_id=None, environment=None, limit=5, max_chars=8000, max_bytes=None
+):
+    environment = validate(query, limit, max_chars, max_bytes, environment)
 
     def search(db):
-        generation = db.execute(
-            "SELECT generation FROM search_generations WHERE project_id=?", [work.project]
-        ).fetchone()
-        corpus = generation[0] if generation else 0
         if not work._memory_allowed(db, actor, task_id):
-            return {
-                "project_id": work.project,
-                "corpus_revision": corpus,
-                "retrieval_mode": "memory_disabled",
-                "truncated": False,
-                "matches": [],
-            }
+            return envelope(db, work.project)
         owner = work._owner(db, actor)  # private memory is visible to its human owner's agents
-        lexical = _lexical(db, work.project, owner, query)
-        # The mode reports whether semantic search ran, not whether it found anything: an empty
-        # result under the distance floor is normal, a missing embedder or vector index is not.
-        semantic, ran = [], False
-        if query_vector:
-            try:
-                semantic, ran = _semantic(db, work.project, owner, query_vector), True
-            except sqlite3.OperationalError:
-                pass
-        scores = {}
-        for source, rows in (("keyword", lexical), ("semantic", semantic)):
-            for rank, key in enumerate(rows, 1):
-                item = scores.setdefault(key, {"score": 0.0, "reasons": []})
-                item["score"] += 1 / (RRF_K + rank)
-                item["reasons"].append(source)
-        results = []
-        for key, rank in scores.items():
-            item = _details(db, work, *key, environment)
-            if item is not None:
-                item.update(rank)
-                if item["status"] == "verified":
-                    item["reasons"].append("verified revision")
-                if item.get("applicability_missing"):
-                    item["reasons"].append("applicability unknown")
-                elif item["applicability"]:
-                    item["reasons"].append("applicability match")
-                results.append(item)
-        results.sort(
-            key=lambda r: (
-                r["status"] != "verified",
-                -(len(r["applicability"]) - len(r.get("applicability_missing", ()))),
-                -r["score"],
-                r["id"],
-            )
-        )
-        matches, used, truncated = [], 0, len(results) > limit
-        for item in results[:limit]:
-            remaining = max_chars - used
-            if remaining <= 0:
-                truncated = True
-                break
-            if len(item["summary"]) > remaining:
-                item["summary"] = item["summary"][:remaining]
-                truncated = True
-            used += len(item["summary"])
-            item.pop("score")
-            matches.append(item)
+        results, ran = ranked(db, work, owner, query, query_vector, environment)
+        results.sort(key=lambda r: (*order(r), r["id"]))
+        matches, truncated = budget(results[:limit], max_chars, len(results) > limit)
         return {
-            "project_id": work.project,
-            "corpus_revision": corpus,
-            "retrieval_mode": "hybrid" if ran else "keyword_only",
+            **envelope(db, work.project, "hybrid" if ran else "keyword_only"),
             "truncated": truncated,
             "matches": matches,
         }
 
     with SEARCHES:
-        vector = EMBEDDER.embed([query])
-        query_vector = vector[0] if vector else None
-        return work.store.read(search)
+        query_vector = embedded(query)
+        return fit_context_bytes(work.store.read(search), max_bytes)

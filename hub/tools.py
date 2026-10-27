@@ -12,6 +12,7 @@ import anyio
 from mcp.server import MCPServer
 from mcp.server.mcpserver import Context
 from mcp.server.mcpserver.exceptions import ToolError
+from pydantic import StrictInt
 from starlette.requests import Request
 
 from hub import api, federation
@@ -45,7 +46,8 @@ def _signature(operation):
 @server.tool(
     description="Run a work or memory operation, passing its arguments as `arguments`. "
     "Writes need an idempotency_key. Operations:\n"
-    + "\n".join(_signature(operation) for operation in api.OPERATIONS)
+    # Troubleshooting stays out of default context; the explicit /tshoot skill documents it.
+    + "\n".join(_signature(op) for op in api.OPERATIONS if not op.startswith("tshoot_"))
 )
 async def work(
     project_id: str,
@@ -121,9 +123,13 @@ async def context_get(
     environment: dict | None = None,
     limit: int = 5,
     max_chars: int = 8000,
+    max_bytes: StrictInt | None = None,
 ) -> dict:
     """Retrieve bounded permitted context, with trust and source reasons. limit is 1 to 5 and
-    max_chars 1 to 8000."""
+    max_chars 1 to 8000. Optional max_bytes is an exact integer 1 to 65536 bounding
+    the complete context object encoded by hub.store.encoded as UTF-8, including
+    metadata and byte_omitted_matches. It omits whole ranked-tail matches; errors
+    and HTTP/MCP wrappers are outside this budget. None preserves legacy output."""
     return await _run(
         ctx,
         lambda store, p: api.call(
@@ -137,6 +143,7 @@ async def context_get(
                 environment=environment,
                 limit=limit,
                 max_chars=max_chars,
+                max_bytes=max_bytes,
             ),
         ),
     )

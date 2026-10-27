@@ -1,0 +1,38 @@
+[
+  {
+    "key": "starter:sre-troubleshooting-loop",
+    "hook": "Hypothetico-deductive troubleshooting loop: observe, hypothesize, test, record",
+    "body": "Troubleshoot as a loop: state the expected and the observed behaviour, examine telemetry and logs, form a hypothesis about the cause, then test it by comparing observed state with predictions or by a controlled change. Prefer the simplest explanation first, record each hypothesis and test result, and avoid treating correlation as causation. Stop the bleeding (mitigate) before seeking the root cause when users are affected.",
+    "sources": ["https://sre.google/sre-book/effective-troubleshooting/"]
+  },
+  {
+    "key": "starter:recent-changes",
+    "hook": "Start with what changed recently: deploys, configuration, dependencies, load",
+    "body": "Recent changes are a productive starting point: list deployments, configuration edits, dependency or certificate updates, infrastructure changes and traffic shifts in the window before the symptom began. Correlate their timestamps with the first observed failure, and confirm a suspected change by reverting or isolating it where that is authorized and safe.",
+    "sources": ["https://sre.google/sre-book/effective-troubleshooting/"]
+  },
+  {
+    "key": "starter:use-method",
+    "hook": "USE method: check utilization, saturation and errors for every resource",
+    "body": "For each resource (CPUs, memory, storage devices, network interfaces, controllers, and software resources such as locks or thread pools), check Utilization (time busy), Saturation (queued or waiting work) and Errors. Work through the resource list systematically to find bottlenecks quickly and to rule resources out with evidence.",
+    "sources": ["https://www.brendangregg.com/usemethod.html"]
+  },
+  {
+    "key": "starter:red-method",
+    "hook": "RED method: request rate, errors and duration for each service",
+    "body": "For each request-serving service, check Rate (requests per second), Errors (failed requests per second) and Duration (latency distribution, not only the average). Compare these with their normal baseline and across dependent services to locate where a user-visible failure starts.",
+    "sources": ["https://grafana.com/blog/2018/08/02/the-red-method-how-to-instrument-your-services/"]
+  },
+  {
+    "key": "starter:bisect",
+    "hook": "Bisect between a known-good and a known-bad version to find the first bad change",
+    "body": "When a regression appeared between two revisions, mark a known-good and a known-bad revision and test the midpoint repeatedly (git bisect) until the first bad commit is found. Use a scripted, deterministic reproduction (git bisect run) so each step gives the same verdict; mark untestable revisions as skipped rather than guessing.",
+    "sources": ["https://git-scm.com/docs/git-bisect"]
+  },
+  {
+    "key": "starter:log-window",
+    "hook": "Read logs in a narrow time window around the first failure, across components",
+    "body": "Establish when the symptom first occurred, then read logs from every involved component in a narrow window around it (for systemd hosts, journalctl --since/--until with -u for each unit). Look for the earliest error rather than the loudest one, and check clock agreement before correlating events across hosts.",
+    "sources": ["https://www.freedesktop.org/software/systemd/man/latest/journalctl.html"]
+  }
+]

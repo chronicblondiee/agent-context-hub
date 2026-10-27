@@ -187,6 +187,52 @@ class ApiTest(unittest.TestCase):
             404,
         )
 
+    def test_context_bytes_validation_access_and_private_owners(self):
+        memory = {
+            "namespace": "n",
+            "kind": "fact",
+            "body": "docker restart 雪",
+            "provenance": "tested",
+            "confidence": 1,
+            "evidence": ["test:bytes"],
+        }
+        for i in range(3):
+            self.assertEqual(self.op("remember", memory, idem=f"byte-{i}")[0], 200)
+        self.assertEqual(
+            self.op("remember", {**memory, "visibility": "private"}, key="peer", idem="private")[0],
+            200,
+        )
+        with patch("hub.retrieval.EMBEDDER.embed", return_value=None):
+            for suffix in ("context", "work/context_get"):
+                path = "/v2/projects/p1/" + suffix
+                args = {"query": "docker restart", "max_bytes": 65536}
+                status, full = self.req("POST", path, args)
+                self.assertEqual(status, 200, full)
+                self.assertEqual(len(full["matches"]), 3)
+                expected = {
+                    **full,
+                    "matches": full["matches"][:1],
+                    "truncated": True,
+                    "byte_omitted_matches": 2,
+                }
+                budget = len(
+                    json.dumps(
+                        expected, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+                    ).encode("utf-8")
+                )
+                self.assertEqual(
+                    self.req("POST", path, {**args, "max_bytes": budget}), (200, expected)
+                )
+                for row in expected["matches"]:
+                    status, record = self.req("GET", f"/v2/projects/p1/records/{row['id']}")
+                    self.assertEqual((status, record["id"]), (200, row["id"]))
+                for invalid in (True, False, "1024", 1.5, 0, -1, 65537, 1):
+                    status, error = self.req("POST", path, {**args, "max_bytes": invalid})
+                    self.assertEqual(status, 400, error)
+                    self.assertIn("max_bytes", error["error"])
+                self.assertEqual(self.req("POST", path, args, key=None)[0], 401)
+                self.assertEqual(self.req("POST", path.replace("p1", "p2"), args)[0], 404)
+
     def test_principal_is_the_actor(self):
         status, task = self.op(
             "create_task", {"goal": "g", "acceptance": [], "actor": "boss", "author": "boss"}

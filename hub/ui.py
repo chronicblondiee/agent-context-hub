@@ -21,6 +21,7 @@ from fastapi import APIRouter, Depends, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
 from hub import api, identity
+from hub.library import disclosable
 from hub.store import now_us
 
 COOKIE = "hub_ui_key"
@@ -88,6 +89,7 @@ TABS = (
     ("/attempts", "Attempts"),
     ("/search", "Search"),
     ("/threads", "Investigations"),
+    ("/proposals", "Library proposals"),
 )
 
 
@@ -508,10 +510,14 @@ def search_page(project: str, request: Request, q: str = ""):
 def record_page(project: str, record_id: str, request: Request):
     row = read(
         request,
-        lambda db: db.execute(
-            "SELECT * FROM memory_records WHERE project_id=? AND id=? AND visibility='project'",
-            [project, record_id],
-        ).fetchone(),
+        lambda db: (
+            db.execute(
+                "SELECT * FROM memory_records WHERE project_id=? AND id=? AND visibility='project'",
+                [project, record_id],
+            ).fetchone()
+            if disclosable(db, project, record_id)
+            else None
+        ),
     )
     if row is None:
         return page("message", title="not found", message="No such project-visible record.")
@@ -549,7 +555,7 @@ def solution_page(project: str, solution_id: str, request: Request):
         s = db.execute(
             "SELECT * FROM solutions WHERE project_id=? AND id=?", [project, solution_id]
         ).fetchone()
-        if s is None:
+        if s is None or not disclosable(db, project, solution_id, s["current_revision"]):
             return None
         rev = db.execute(
             "SELECT body, repository_commit, image_digest FROM solution_revisions "
@@ -659,6 +665,19 @@ def decide(
     return back(project, act(request, project, key, "solution_decide", arguments))
 
 
+@router.post("/p/{project}/proposals/{proposal_id}/decide")
+def publication_decide(
+    project: str,
+    proposal_id: str,
+    request: Request,
+    key: str = Form(""),
+    action: str = Form(""),
+    reason: str = Form(""),
+):
+    arguments = {"proposal_id": proposal_id, "action": action, "reason": reason}
+    return back(project, act(request, project, key, "tshoot_publication_decide", arguments))
+
+
 def thread_reader(request, project):
     """Incident reads always require a project-granted human, including loopback UI."""
     principal = identity.authenticate(request.app.state.store, request.cookies.get(COOKIE, ""))
@@ -734,3 +753,63 @@ def thread_timeline(project: str, thread_id: str, request: Request, cursor: int 
             "Next page",
         )
     return page("timeline", title="Investigation " + thread_id, content=Raw(content))
+
+
+@router.get("/p/{project}/proposals", response_class=HTMLResponse)
+def proposals_page(project: str, request: Request, cursor: int = 0):
+    """Library proposals and their governance history, for maintainers of this project."""
+    principal = thread_reader(request, project)
+    try:
+        rows = api.call(
+            request.app.state.store,
+            principal,
+            project,
+            "tshoot_proposals",
+            {"cursor": cursor, "limit": 40},
+        )
+    except api.HANDLED as error:
+        return page("message", title="refused", message=api.classify(error)[1])
+
+    def decide_form(r):
+        if r["status"] != "proposed" or r["source_project"] != project:
+            return r["reason"] or ""
+        action = f"/ui/p/{quote(project)}/proposals/{quote(r['id'])}/decide"
+        return Raw(
+            f'<form method="post" action="{html.escape(action)}">'
+            '<select name="action"><option>publish</option><option>reject</option></select> '
+            '<input name="reason" placeholder="review reason" required> '
+            '<input type="password" name="key" placeholder="your hub key" autocomplete="off" '
+            "required> <button>Decide</button></form>"
+        )
+
+    content = table(
+        ["proposal", "source", "library", "status", "body", "applicability", "evidence", "review"],
+        [
+            [
+                r["id"][:12],
+                f"{r['source_project']}/{r['source_kind']} {r['source_id'][:12]} "
+                f"rev {r['source_revision']}",
+                r["library_project"] + (f" {r['dest_id'][:12]}" if r["dest_id"] else ""),
+                r["status"] + (f" by {r['reviewer']}" if r["reviewer"] else ""),
+                Raw(f"<pre>{html.escape(r['body'])}</pre>"),
+                json.dumps(r["applicability"]),
+                json.dumps(r["evidence"]),
+                decide_form(r),
+            ]
+            for r in rows
+        ],
+    )
+    if len(rows) == 40:
+        content = Raw(
+            content + link(f"/ui/p/{quote(project)}/proposals?cursor={cursor + 40}", "Next page")
+        )
+    return page(
+        "timeline",
+        title="Library proposals",
+        content=Raw(
+            tabs(project, "Library proposals")
+            + "<p>Publishing needs a human maintainer of this project and the library. "
+            "Published memories are unverified leads; solution copies need their own "
+            "evidence or approval.</p>" + content
+        ),
+    )

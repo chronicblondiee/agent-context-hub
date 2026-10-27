@@ -1,5 +1,6 @@
 """M4 search, queue, and revision-bound trust contracts."""
 
+import json
 import os
 import sqlite3
 import tempfile
@@ -261,6 +262,213 @@ class KnowledgeTest(unittest.TestCase):
             for thread in threads:
                 thread.join()
         self.assertEqual(peak[0], 1)
+
+    def _max_bytes_record(self, actor="bob", **kwargs):
+        return self.work.remember(
+            actor,
+            "n",
+            "fact",
+            'docker restart 雪🙂"\\\n' * 3,
+            "tested",
+            1,
+            ["test:bytes:" + str(i) + ":" + "x" * 48 for i in range(3)],
+            **kwargs,
+        )["id"]
+
+    def _context_bytes(self, result):
+        return len(
+            json.dumps(result, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode(
+                "utf-8"
+            )
+        )
+
+    def test_max_bytes_none_preserves_legacy_and_max_chars(self):
+        self._max_bytes_record()
+        legacy = self.work.context_get("bob", "docker restart", max_chars=8)
+        self.assertNotIn("byte_omitted_matches", legacy)
+        self.assertEqual(
+            self.work.context_get("bob", "docker restart", max_chars=8, max_bytes=None),
+            legacy,
+        )
+        bounded = self.work.context_get("bob", "docker restart", max_chars=8, max_bytes=65536)
+        self.assertEqual(bounded, {**legacy, "byte_omitted_matches": 0})
+        self.assertLessEqual(sum(len(row["summary"]) for row in bounded["matches"]), 8)
+
+    def test_max_bytes_exact_fit_and_one_byte_under(self):
+        self._max_bytes_record()
+        full = self.work.context_get("bob", "docker restart", max_bytes=65536)
+        size = self._context_bytes(full)
+        self.assertEqual(self.work.context_get("bob", "docker restart", max_bytes=size), full)
+        smaller = self.work.context_get("bob", "docker restart", max_bytes=size - 1)
+        self.assertLessEqual(self._context_bytes(smaller), size - 1)
+        self.assertEqual(smaller["matches"], [])
+        self.assertEqual(smaller["byte_omitted_matches"], 1)
+        self.assertTrue(smaller["truncated"])
+
+    def test_max_bytes_keeps_ranked_prefix_and_all_metadata(self):
+        for _ in range(3):
+            self._max_bytes_record()
+        full = self.work.context_get("bob", "docker restart", max_bytes=65536)
+        self.assertEqual(len(full["matches"]), 3)
+        expected = {
+            **full,
+            "matches": full["matches"][:-1],
+            "byte_omitted_matches": 1,
+            "truncated": True,
+        }
+        size = self._context_bytes(expected)
+        page = self.work.context_get("bob", "docker restart", max_bytes=size)
+        self.assertEqual(page, expected)
+        self.assertEqual(self._context_bytes(page), size)
+        self.assertGreater(self._context_bytes(full), len(store_module.encoded(full)))
+        for actual, original in zip(page["matches"], full["matches"], strict=False):
+            self.assertEqual(actual, original)  # citation/author/provenance/revision intact
+        self.assertEqual(full["byte_omitted_matches"], 0)
+
+    def test_max_bytes_rejects_invalid_or_impossible_budgets(self):
+        for invalid in (True, False, 0, -1, 65537, 1.5, "100", [], {}):
+            with self.subTest(max_bytes=invalid):
+                with self.assertRaisesRegex(ValueError, "max_bytes"):
+                    self.work.context_get("bob", "docker restart", max_bytes=invalid)
+        with self.assertRaisesRegex(ValueError, "max_bytes too small for context envelope"):
+            self.work.context_get("bob", "docker restart", max_bytes=1)
+
+    def test_max_bytes_no_matches_and_memory_disabled(self):
+        self._max_bytes_record()
+        for expected_mode, query in (
+            ("keyword_only", "unmatched zzqq"),
+            ("memory_disabled", "docker restart"),
+        ):
+            page = self.work.context_get("alice", query, max_bytes=1024)
+            self.assertEqual(page["matches"], [])
+            self.assertEqual(page["retrieval_mode"], expected_mode)
+            self.assertEqual(page["byte_omitted_matches"], 0)
+            self.assertFalse(page["truncated"])
+            self.assertLessEqual(self._context_bytes(page), 1024)
+            size = self._context_bytes(page)
+            self.assertEqual(self.work.context_get("alice", query, max_bytes=size), page)
+            with self.assertRaisesRegex(ValueError, "context envelope"):
+                self.work.context_get("alice", query, max_bytes=size - 1)
+            with self.assertRaisesRegex(ValueError, "max_bytes too small for context envelope"):
+                self.work.context_get("alice", query, max_bytes=1)
+            if expected_mode == "keyword_only":
+                task = self.work.create_task("alice", "quiet", [], no_memory=True)["id"]
+                self.work.resume("alice", task)
+
+    def test_max_bytes_does_not_count_inaccessible_or_other_project_records(self):
+        hidden = self._max_bytes_record("alice", visibility="private")
+        visible = self._max_bytes_record("bob")
+        page = self.work.context_get("bob", "docker restart", max_bytes=65536)
+        self.assertEqual([row["id"] for row in page["matches"]], [visible])
+        self.assertNotIn(hidden, store_module.encoded(page))
+        self.assertEqual(page["byte_omitted_matches"], 0)
+        other = Work(self.store, "two").context_get("bob", "docker restart", max_bytes=1024)
+        self.assertEqual(other["matches"], [])
+        self.assertEqual(other["byte_omitted_matches"], 0)
+
+    def test_max_bytes_mixed_ranked_records_and_empty_boundary(self):
+        self._max_bytes_record()
+        self.work.attempt_record("bob", "docker restart", "tested 雪", ["test:attempt"])
+        solution = self.propose(applicability={"os": "linux", "version": "1"})["id"]
+        self.propose(
+            solution_id=solution, expected_revision=1, applicability={"os": "linux", "version": "2"}
+        )
+        self.work.solution_decide("boss", solution, 2, "approve", "reviewed")
+        options = {"environment": {"os": "linux"}}
+        full = self.work.context_get("bob", "docker restart", max_bytes=65536, **options)
+        self.assertEqual({r["kind"] for r in full["matches"]}, {"memory", "attempt", "solution"})
+        first = full["matches"][0]
+        self.assertEqual(
+            (first["id"], first["revision"], first["status"]), (solution, 2, "verified")
+        )
+        self.assertEqual(first["applicability"], {"os": "linux", "version": "2"})
+        self.assertEqual(first["applicability_missing"], ["version"])
+        for retained in (2, 1, 0):
+            expected = {
+                **full,
+                "matches": full["matches"][:retained],
+                "byte_omitted_matches": 3 - retained,
+                "truncated": True,
+            }
+            size = self._context_bytes(expected)
+            actual = self.work.context_get("bob", "docker restart", max_bytes=size, **options)
+            self.assertEqual(actual, expected)
+            self.assertEqual(self._context_bytes(actual), size)
+        with self.assertRaisesRegex(ValueError, "context envelope"):
+            self.work.context_get("bob", "docker restart", max_bytes=size - 1, **options)
+
+    def test_max_bytes_after_limit_and_summary_budget(self):
+        for _ in range(5):
+            self._max_bytes_record()
+        all_rows = self.work.context_get("bob", "docker restart")["matches"]
+        chars = len(all_rows[0]["summary"]) + 7
+        options = {"limit": 3, "max_chars": chars}
+        full = self.work.context_get("bob", "docker restart", **options)
+        self.assertEqual(len(full["matches"]), 2)
+        self.assertEqual(len(full["matches"][1]["summary"]), 7)
+        expected = {**full, "matches": full["matches"][:1], "byte_omitted_matches": 1}
+        page = self.work.context_get(
+            "bob", "docker restart", max_bytes=self._context_bytes(expected), **options
+        )
+        self.assertEqual(page, expected)
+        self.assertTrue(page["truncated"])
+        # Limit alone removes two eligible rows; only the additional byte omission counts.
+        limited = self.work.context_get("bob", "docker restart", limit=3)
+        expected = {**limited, "matches": limited["matches"][:2], "byte_omitted_matches": 1}
+        self.assertEqual(
+            self.work.context_get(
+                "bob", "docker restart", limit=3, max_bytes=self._context_bytes(expected)
+            ),
+            expected,
+        )
+
+    def test_max_bytes_lifecycle_filters_before_counting(self):
+        self._max_bytes_record("alice", visibility="private")
+        revoked = self._max_bytes_record()
+        self.work.revoke_memory("bob", revoked)
+        old = self._max_bytes_record()
+        current = self.work.revise_memory(
+            "bob", old, "docker restart new 雪", "tested", 1, ["test:new"]
+        )["id"]
+        Work(self.store, "two").remember(
+            "bob", "n", "fact", "docker restart", "tested", 1, ["test:other"]
+        )
+        full = self.work.context_get("bob", "docker restart", max_bytes=65536)
+        self.assertEqual([r["id"] for r in full["matches"]], [current])
+        expected = {**full, "matches": [], "truncated": True, "byte_omitted_matches": 1}
+        self.assertEqual(
+            self.work.context_get("bob", "docker restart", max_bytes=self._context_bytes(expected)),
+            expected,
+        )
+
+    def test_max_bytes_real_vector_prefix_and_fallback(self):
+        vector = [1.0] + [0.0] * (MODEL["dim"] - 1)
+        for _ in range(3):
+            ident = self._max_bytes_record()
+            finish_job(
+                self.store,
+                {"project_id": "one", "kind": "memory", "record_id": ident, "revision": 1},
+                [vector],
+            )
+        for embedded, query, mode, reason in (
+            ([vector], "semantic-only-query", "hybrid", "semantic"),
+            (None, "docker restart", "keyword_only", "keyword"),
+        ):
+            with patch("hub.retrieval.EMBEDDER.embed", return_value=embedded):
+                full = self.work.context_get("bob", query, max_bytes=65536)
+                self.assertEqual(len(full["matches"]), 3)
+                self.assertEqual(full["retrieval_mode"], mode)
+                self.assertTrue(all(reason in row["reasons"] for row in full["matches"]))
+                expected = {
+                    **full,
+                    "matches": full["matches"][:2],
+                    "truncated": True,
+                    "byte_omitted_matches": 1,
+                }
+                self.assertEqual(
+                    self.work.context_get("bob", query, max_bytes=self._context_bytes(expected)),
+                    expected,
+                )
 
 
 class EmbeddingTest(unittest.TestCase):

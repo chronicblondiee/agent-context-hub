@@ -189,6 +189,37 @@ class UiTest(unittest.TestCase):
             "done: solution_decide as boss", self.post(path, {**form, "key": self.keys["boss"]})
         )
 
+    def test_library_proposals_publish_through_the_form_and_gate_records(self):
+        from hub import library
+
+        identity.create_project(self.s, "root", "lib", "library")
+        identity.grant(self.s, "root", "lead", "lib", "maintainer")
+        library.configure(self.s, "root", "lib")
+        w = Work(self.s, "p1")
+        proposal = w.tshoot_propose(
+            "worker", self.shared, "sanitized socket fix", ["https://example.test/check"]
+        )["id"]
+        self.assertIn("sign in with a human hub key", self.get("/ui/p/p1/proposals"))
+        opener = urllib.request.build_opener()
+        opener.addheaders = [("Cookie", f"{ui.COOKIE}={self.keys['lead']}")]
+        with opener.open(self.base + "/ui/p/p1/proposals") as response:
+            listed = response.read().decode()
+        self.assertIn("sanitized socket fix", listed)
+        self.assertIn(f"/ui/p/p1/proposals/{proposal}/decide", listed)
+        path = f"/ui/p/p1/proposals/{proposal}/decide"
+        form = {"action": "publish", "reason": "reviewed"}
+        self.assertIn("requires a human", self.post(path, {**form, "key": self.keys["worker"]}))
+        # boss maintains p1 but not the library.
+        self.assertIn("maintainer authority", self.post(path, {**form, "key": self.keys["boss"]}))
+        self.assertIn(
+            "done: tshoot_publication_decide as lead",
+            self.post(path, {**form, "key": self.keys["lead"]}),
+        )
+        dest = self.s.read(lambda db: db.execute("SELECT dest_id FROM publications").fetchone()[0])
+        self.assertIn("sanitized socket fix", self.get(f"/ui/p/lib/r/{dest}"))
+        w.revoke_memory("worker", self.shared)  # withdraws the publication
+        self.assertIn("No such project-visible record", self.get(f"/ui/p/lib/r/{dest}"))
+
     def test_auth_mode_needs_a_human_key_and_honours_revocation(self):
         class Plain(http.cookiejar.DefaultCookiePolicy):  # the test server is plain HTTP
             def return_ok_secure(self, cookie, request):

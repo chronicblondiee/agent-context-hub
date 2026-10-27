@@ -1,0 +1,5 @@
+interface:
+  display_name: "Troubleshoot"
+  short_description: "Troubleshoot a problem with Agent Context Hub context"
+policy:
+  allow_implicit_invocation: false

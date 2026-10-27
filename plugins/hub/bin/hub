@@ -421,6 +421,7 @@ def setup(args, repo, human=False):
     path.write_text(json.dumps(config, indent=2) + "\n")
     if args.client:
         configure_mcp(args.client, repo, config)
+        print(f"Installed /tshoot at {install_tshoot(args.client)}")
     return config
 
 
@@ -459,6 +460,70 @@ def validate_config(config):
         )
     ):
         raise HubError("endpoint must be an HTTPS origin (HTTP allowed on loopback only)")
+
+
+def client_home(client):
+    if client == "claude":
+        return Path(os.environ.get("CLAUDE_CONFIG_DIR", str(Path.home() / ".claude")))
+    return Path(os.environ.get("CODEX_HOME", str(Path.home() / ".codex")))
+
+
+# Troubleshooting is a personal, explicit-only skill (`/tshoot`, Codex `$tshoot`) rather than a
+# plugin skill: plugin skills are namespaced, and keeping it out of the plugin keeps it out of the
+# model's default context until the user invokes it.
+TSHOOT = Path(__file__).resolve().parent.parent / "tshoot"
+MARKER = ".hub-managed"
+
+
+def tshoot_source(client):
+    """The unrendered skill for a client: {relative path: text}."""
+    if not (TSHOOT / "SKILL.md").is_file():
+        raise HubError("troubleshooting skill source missing; run setup from the hub plugin")
+    files = {"SKILL.md": (TSHOOT / "SKILL.md").read_text()}
+    if client == "codex":
+        files["agents/openai.yaml"] = (TSHOOT / "agents/openai.yaml").read_text()
+    return files
+
+
+def tshoot_digest(files):
+    return hashlib.sha256(json.dumps(files, sort_keys=True).encode()).hexdigest()
+
+
+def tshoot_state(client):
+    """Current when the installed copy came from the same skill source and its helper still
+    exists, whichever installed plugin copy (Claude's or Codex's) asks."""
+    target = client_home(client) / "skills" / "tshoot"
+    if not target.exists():
+        return "missing"
+    try:
+        recorded = json.loads((target / MARKER).read_text())
+    except (OSError, ValueError):
+        return "foreign"  # the user's own skill; setup never replaces it
+    current = (
+        recorded.get("source") == tshoot_digest(tshoot_source(client))
+        and Path(recorded.get("helper", "")).is_file()
+    )
+    return "current" if current else "stale"
+
+
+def install_tshoot(client):
+    source, helper = tshoot_source(client), str(Path(__file__).resolve())
+    files = {name: text.replace("{HUB_HELPER}", helper) for name, text in source.items()}
+    target = client_home(client) / "skills" / "tshoot"
+    if tshoot_state(client) == "foreign":
+        raise HubError(f"{target} exists and is not managed by hub; move it to install /tshoot")
+    staging = target.with_name(".tshoot-" + uuid.uuid4().hex)
+    for name, text in files.items():
+        (staging / name).parent.mkdir(parents=True, exist_ok=True)
+        (staging / name).write_text(text)
+    marker = {"source": tshoot_digest(source), "helper": helper}
+    (staging / MARKER).write_text(json.dumps(marker) + "\n")
+    if target.exists():
+        for path in sorted(target.rglob("*"), reverse=True):
+            path.unlink() if path.is_file() or path.is_symlink() else path.rmdir()
+        target.rmdir()
+    staging.rename(target)
+    return target
 
 
 def native_servers(client, repo):
@@ -568,6 +633,14 @@ def diagnostics(repo, config, human=False):
             }
         except (ValueError, OSError, AttributeError, TypeError):
             result[client + "_mcp"] = {"error": "invalid native config; inspect locally"}
+        try:
+            state = tshoot_state(client)
+        except HubError as error:
+            state = str(error)
+        result[client + "_tshoot_skill"] = {
+            "state": state,
+            "next_step": "setup --client " + client + " installs or refreshes it.",
+        }
     if result["disabled"] or result["no_memory"]:
         result["server_error"] = "disabled/no-memory: server lookup suppressed"
         return result

@@ -7,6 +7,7 @@ import json
 
 from hub.common import Stale, bounded, references, uid
 from hub.knowledge import Knowledge
+from hub.library import Library, disclosable
 from hub.memory import Memory
 from hub.store import encoded, now_us
 from hub.troubleshooting import Troubleshooting
@@ -18,7 +19,7 @@ RETRY_LIMIT = 3
 PACKET_BYTES = 8192
 
 
-class Work(Troubleshooting, Knowledge, Memory):
+class Work(Library, Troubleshooting, Knowledge, Memory):
     """One project's work and memory. Build one per request: an idempotency key covers the
     single mutation that request performs."""
 
@@ -27,10 +28,12 @@ class Work(Troubleshooting, Knowledge, Memory):
         self.idempotency_key, self.request = idempotency_key, request
         self.agent_session = agent_session
 
-    def context_get(self, actor, query, task_id=None, environment=None, limit=5, max_chars=8000):
+    def context_get(
+        self, actor, query, task_id=None, environment=None, limit=5, max_chars=8000, max_bytes=None
+    ):
         from hub.retrieval import context
 
-        return context(self, actor, query, task_id, environment, limit, max_chars)
+        return context(self, actor, query, task_id, environment, limit, max_chars, max_bytes)
 
     def _mutate(self, actor, fn):
         return self.store.mutate(self.project, actor, fn, self.idempotency_key, self.request)
@@ -159,9 +162,12 @@ class Work(Troubleshooting, Knowledge, Memory):
             return actor in tuple(row)
         record = self._memory_row(db, ident)
         if record:
-            return self._memory_visible(record, self._owner(db, actor))
-        if self._solution(db, ident):
-            return True
+            return self._memory_visible(record, self._owner(db, actor)) and disclosable(
+                db, self.project, ident
+            )
+        solution = self._solution(db, ident)
+        if solution:
+            return disclosable(db, self.project, ident, solution["current_revision"])
         return bool(
             db.execute(
                 "SELECT 1 FROM attempts WHERE project_id=? AND id=?", [self.project, ident]

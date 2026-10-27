@@ -8,6 +8,7 @@ import math
 import uuid
 
 from hub.index import deindex, index
+from hub.library import disclosable, withdraw
 from hub.store import encoded, now_us
 
 PROVENANCE = ("stated", "tested", "assumed", "inferred")
@@ -148,6 +149,7 @@ class Memory:
                     [ident, self.project, supersedes],
                 )
                 deindex(tx, "memory", supersedes)
+                withdraw(tx, self.project, supersedes)
                 tx.change("supersede", supersedes, {"superseded_by": ident})
             index(tx, "memory", ident, 1, body)
             if supersedes:
@@ -196,6 +198,7 @@ class Memory:
                     [self.project, memory_id],
                 )
                 deindex(tx, "memory", memory_id)
+                withdraw(tx, self.project, memory_id)
                 from hub import federation
 
                 federation.changed(tx, memory_id)
@@ -210,7 +213,11 @@ class Memory:
 
         def fn(con):
             record = self._memory_row(con, memory_id)
-            visible = record and self._memory_visible(record, self._owner(con, actor))
+            visible = (
+                record
+                and self._memory_visible(record, self._owner(con, actor))
+                and disclosable(con, self.project, memory_id, actor=actor)
+            )
             return record if visible else None
 
         return self.store.read(fn)
