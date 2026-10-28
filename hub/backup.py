@@ -151,6 +151,11 @@ def restore(backup, path):
             n = tx.execute(
                 "UPDATE keys SET revoked_us = ? WHERE revoked_us IS NULL", [now]
             ).rowcount
+            tx.execute(
+                "UPDATE memory_source_checks SET generation=generation+1, "
+                "state=CASE WHEN state='claimed' THEN 'pending' ELSE state END, "
+                "lease_until_us=NULL,claimant=NULL"
+            )
             tx.audit("restore.revoke_keys", name, {"revoked": n})
             return n
 

@@ -16,6 +16,8 @@ services:
       HUB_MODEL_DIR: ${HUB_MODEL_DIR:-/opt/models/minilm}
       # Optional web UI; disabled by default.
       HUB_UI: ${HUB_UI:-0}
+      HUB_CHECK_ENDPOINTS: ${HUB_CHECK_ENDPOINTS:-[]}
+      HUB_CHECK_INTERVAL_SECONDS: ${HUB_CHECK_INTERVAL_SECONDS:-900}
     # Empty HUB_PORT selects an ephemeral port. Bind to loopback by default.
     ports: ["${HUB_BIND:-127.0.0.1}:${HUB_PORT:-}:8097"]
     volumes:
@@ -62,3 +64,26 @@ services:
     volumes:
       - ${HUB_STATE:?}/federation-secrets/nats.conf:/etc/nats/nats.conf:ro,z
       - ${HUB_STATE:?}/nats-data:/data:z
+
+  checker:
+    profiles: [checker]
+    image: ${HUB_CHECKER_IMAGE:-hub-public-checker}
+    user: ${HUB_UID:?}:${HUB_GID:?}
+    read_only: true
+    tmpfs: ["/tmp:size=16m"]
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 128m
+    cpus: 0.25
+    pids_limit: 32
+    restart: unless-stopped
+    environment:
+      HUB_ENDPOINT: http://core:8097
+      HUB_PROJECT: ${HUB_CHECK_PROJECT:-}
+      HUB_KEY_FILE: /secrets/hub.key
+      HUB_CHECK_CONFIG: /secrets/sources.json
+    volumes:
+      - ${HUB_STATE:?}/checker-secrets:/secrets:ro,z
+    depends_on:
+      core:
+        condition: service_healthy

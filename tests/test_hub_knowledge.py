@@ -241,6 +241,20 @@ class KnowledgeTest(unittest.TestCase):
             0,
         )
 
+    def test_equal_scores_order_by_best_rank_then_newer(self):
+        from hub.retrieval import order, tiebreak
+
+        # A real tie: rank 1 in one list (1/61) vs. rank 62 in both (1/122 + 1/122).
+        base = {"status": "unverified", "applicability": {}}
+        items = [
+            {**base, "id": "0", "best": 62, "score": 1 / 122 + 1 / 122, "created_us": 3},
+            {**base, "id": "1", "best": 1, "score": 1 / 61, "created_us": 1},
+            {**base, "id": "2", "best": 1, "score": 1 / 61, "created_us": 2},
+        ]
+        self.assertEqual(items[0]["score"], items[1]["score"])
+        items.sort(key=lambda r: (*order(r), *tiebreak(r)))
+        self.assertEqual([r["id"] for r in items], ["2", "1", "0"])
+
     def test_concurrent_searches_run_one_at_a_time(self):
         active, peak, lock = [0], [0], threading.Lock()
 
@@ -374,7 +388,7 @@ class KnowledgeTest(unittest.TestCase):
             solution_id=solution, expected_revision=1, applicability={"os": "linux", "version": "2"}
         )
         self.work.solution_decide("boss", solution, 2, "approve", "reviewed")
-        options = {"environment": {"os": "linux"}}
+        options = {"environment": {"os": "linux"}, "view": "all"}
         full = self.work.context_get("bob", "docker restart", max_bytes=65536, **options)
         self.assertEqual({r["kind"] for r in full["matches"]}, {"memory", "attempt", "solution"})
         first = full["matches"][0]
@@ -470,6 +484,53 @@ class KnowledgeTest(unittest.TestCase):
                     expected,
                 )
 
+    def test_semantic_freshness_eligibility_precedes_top_k(self):
+        from hub.embed import MODEL, MODEL_KEY
+
+        vector = [1.0] + [0.0] * (MODEL["dim"] - 1)
+        import struct
+
+        blob = struct.pack(f"<{MODEL['dim']}f", *vector)
+        records = []
+        for i in range(55):
+            records.append(
+                self.work.remember(
+                    "alice",
+                    "ops",
+                    "fact",
+                    f"unrelated synthetic record {i}",
+                    "stated",
+                    1,
+                    ["source:synthetic"],
+                    temporal_kind="historical",
+                )["id"]
+            )
+        live = self.work.remember(
+            "alice",
+            "ops",
+            "fact",
+            "unrelated live synthetic",
+            "stated",
+            1,
+            ["source:synthetic"],
+            temporal_kind="durable",
+        )["id"]
+
+        def vectors(tx):
+            for ident in [*records, live]:
+                tx.execute(
+                    "INSERT INTO chunk_vectors(project_id,kind,record_id,revision,"
+                    "chunk,model,dim,vector) "
+                    "VALUES (?,?,?,?,?,?,?,?)",
+                    ["one", "memory", ident, 1, 0, MODEL_KEY, MODEL["dim"], blob],
+                )
+            tx.audit("test.vectors", "synthetic", {})
+
+        self.store.mutate("one", "alice", vectors)
+        with patch("hub.retrieval.embedded", return_value=vector):
+            matches = self.work.context_get("bob", "semantic-only-query")["matches"]
+        self.assertEqual([r["id"] for r in matches], [live])
+
 
 class EmbeddingTest(unittest.TestCase):
     def test_offline_model_vector_and_missing_directory(self):
@@ -517,6 +578,14 @@ class MigrationTest(unittest.TestCase):
                 )
             con.close()
             self.assertEqual(migrate(path), store_module.SCHEMA_VERSION)
+            migrated = Store(path)
+            try:
+                old = Work(migrated, "old").record("alice", "active")
+                self.assertEqual(old["freshness"], "freshness unknown")
+                self.assertIsNone(old["observed_us"])
+                self.assertIsNone(old["checked_us"])
+            finally:
+                migrated.close()
             con = connect(path)
             self.assertEqual(
                 [r[0] for r in con.execute("SELECT record_id FROM search_fts")], ["active"]

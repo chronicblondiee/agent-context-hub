@@ -280,15 +280,48 @@ class LibraryTest(unittest.TestCase):
         with patch("hub.retrieval.EMBEDDER.embed", return_value=[[0.0] * 384]):
             self.assertEqual(self.ask("postgres refused")["retrieval_mode"], "hybrid")
 
+    def test_publication_inherits_freshness_without_private_review_evidence(self):
+        source = self.memory("router latest firmware")
+        self.publish(source, "router latest firmware")
+        self.p1.memory_review(
+            "worker",
+            source,
+            1,
+            "conflict",
+            evidence=["private:review"],
+            proposed_correction="private proposed correction",
+        )
+        self.assertEqual(self.ask("router latest firmware", view="current")["matches"], [])
+        historical = self.ask("router latest firmware")["matches"][0]
+        self.assertEqual(historical["freshness"], "review required")
+        self.assertNotIn("private:", json.dumps(historical))
+        self.assertNotIn("private proposed", json.dumps(historical))
+        self.p1.memory_review(
+            "worker", source, 2, "confirm", temporal_kind="durable", evidence=["checked:new"]
+        )
+        self.assertEqual(
+            self.ask("router latest firmware", view="current")["matches"][0]["freshness"], "current"
+        )
+
     def test_one_shared_budget(self):
         self.publish(self.memory("oom killer kills java"), "oom killer kills java " + "x" * 300)
         self.memory("oom killer kills java locally " + "y" * 300, self.p2)
         clipped = self.ask("oom killer java", max_chars=100)
         self.assertEqual(sum(len(m["summary"]) for m in clipped["matches"]), 100)
         self.assertTrue(clipped["truncated"])
-        bounded = self.ask("oom killer java", max_bytes=1200)
+        full = self.ask("oom killer java", max_bytes=65536)
+        expected = {
+            **full,
+            "matches": full["matches"][:1],
+            "byte_omitted_matches": 1,
+            "truncated": True,
+        }
+        size = len(
+            json.dumps(expected, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+        )
+        bounded = self.ask("oom killer java", max_bytes=size)
         self.assertEqual(bounded["byte_omitted_matches"], 1)
-        self.assertLessEqual(len(json.dumps(bounded, separators=(",", ":"))), 1200)
+        self.assertLessEqual(len(json.dumps(bounded, separators=(",", ":"))), size)
         with self.assertRaisesRegex(ValueError, "max_chars"):
             self.ask("oom", max_chars=0)
 

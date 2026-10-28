@@ -124,6 +124,7 @@ async def context_get(
     limit: int = 5,
     max_chars: int = 8000,
     max_bytes: StrictInt | None = None,
+    view: str = "current",
 ) -> dict:
     """Retrieve bounded permitted context, with trust and source reasons. limit is 1 to 5 and
     max_chars 1 to 8000. Optional max_bytes is an exact integer 1 to 65536 bounding
@@ -144,6 +145,7 @@ async def context_get(
                 limit=limit,
                 max_chars=max_chars,
                 max_bytes=max_bytes,
+                view=view,
             ),
         ),
     )

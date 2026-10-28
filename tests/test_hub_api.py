@@ -187,6 +187,21 @@ class ApiTest(unittest.TestCase):
             404,
         )
 
+    def test_context_reports_queue_and_search_time(self):
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{self.port}/v2/projects/p1/context",
+            data=json.dumps({"query": "docker"}).encode(),
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": "Bearer " + self.keys["worker"]["key"],
+            },
+        )
+        with patch("hub.retrieval.EMBEDDER.embed", return_value=None):
+            with urllib.request.urlopen(request) as response:
+                timing = response.headers["Server-Timing"]
+        self.assertRegex(timing, r"^queue;dur=[\d.]+, search;dur=[\d.]+$")
+
     def test_context_bytes_validation_access_and_private_owners(self):
         memory = {
             "namespace": "n",
@@ -395,3 +410,29 @@ class ApiTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+    def test_freshness_review_roles_fencing_and_views(self):
+        status, made = self.op(
+            "remember",
+            dict(
+                namespace="ops",
+                kind="fact",
+                body="router firmware",
+                provenance="stated",
+                confidence=1,
+                evidence=["source:test"],
+            ),
+            idem="fresh-memory",
+        )
+        self.assertEqual(status, 200)
+        args = dict(memory_id=made["id"], expected_revision=1, action="historical")
+        self.assertEqual(self.op("memory_review", args, key="viewer", idem="review-denied")[0], 403)
+        self.assertEqual(self.op("memory_review", args, key="peer", idem="review-other")[0], 400)
+        self.assertEqual(self.op("memory_review", args, idem="review-ok")[0], 200)
+        self.assertEqual(self.op("memory_review", args, idem="review-stale")[0], 409)
+        self.assertEqual(self.op("context_get", dict(query="router"))[1]["matches"], [])
+        self.assertEqual(
+            self.op("context_get", dict(query="router", view="history"))[1]["matches"][0]["id"],
+            made["id"],
+        )
+        self.assertEqual(self.op("source_check_claim", {}, idem="claim-denied")[0], 403)

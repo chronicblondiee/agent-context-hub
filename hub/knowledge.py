@@ -424,7 +424,13 @@ class Knowledge:
                 "SELECT * FROM attempts WHERE project_id=? AND id=?", [self.project, ident]
             ).fetchone()
             return (
-                {"kind": "attempt", **dict(row), "evidence": json.loads(row["evidence"])}
+                {
+                    "kind": "attempt",
+                    **dict(row),
+                    "evidence": json.loads(row["evidence"]),
+                    "freshness": "historical",
+                    "observed_us": row["created_us"],
+                }
                 if row
                 else None
             )

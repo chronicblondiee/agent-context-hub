@@ -149,3 +149,32 @@ class BackupTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+    def test_restore_invalidates_source_worker_leases(self):
+        from unittest.mock import patch
+
+        with patch.dict("os.environ", HUB_CHECK_ENDPOINTS='["forge"]'):
+            work = Work(self.s, "p1")
+            source = dict(endpoint="forge", repository="example/repo", kind="issue", number=1)
+            work.memory_source_bind("worker", self.memory, 1, source, "a" * 64)
+            claim = work.source_check_claim("checker")["job"]
+            made = backup.create(self.s, self.root)
+            target = self.target("source-restored")
+            backup.restore(self.root / made["backup"], target)
+            restored = Store(target)
+            try:
+                from hub.common import Stale
+
+                new = Work(restored, "p1")
+                with self.assertRaises(Stale):
+                    new.source_check_complete(
+                        "checker",
+                        claim["id"],
+                        claim["generation"],
+                        claim["target_revision"],
+                        observed_fingerprint="a" * 64,
+                    )
+                replacement = new.source_check_claim("checker")["job"]
+                self.assertGreater(replacement["generation"], claim["generation"])
+            finally:
+                restored.close()

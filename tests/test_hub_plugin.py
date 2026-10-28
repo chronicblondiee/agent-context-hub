@@ -408,6 +408,12 @@ sys.exit(code)
         self.assertEqual(len(item["retrieval"]["summary"]), 150)
         self.assertEqual(item["retrieval"]["hook"], "label")
         self.assertNotIn("evidence", item["retrieval"])
+        # A reassessed own record is news again; its fingerprint carries the new freshness.
+        matches[1] = dict(matches[1], freshness="review required", freshness_revision=2)
+        ids, packet = run("UserPromptSubmit")
+        self.assertEqual(ids, ["mine"])
+        self.assertEqual(packet["items"][0]["retrieval"]["freshness"], "review required")
+        self.assertNotIn("observed_us", packet["items"][0]["retrieval"])  # nulls are omitted
 
     def test_setup_preserves_settings_and_reuses_equivalent_mcp(self):
         helper = load_cli()

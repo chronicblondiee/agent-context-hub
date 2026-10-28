@@ -252,3 +252,32 @@ class UiTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+    def test_review_inbox_form_and_bulk_preview(self):
+        identity.grant(self.s, "root", "lead", "p1", "contributor")
+        opener = urllib.request.build_opener()
+        opener.addheaders = [("Cookie", f"{ui.COOKIE}={self.keys['lead']}")]
+        with opener.open(self.base + "/ui/p/p1/review") as response:
+            text = response.read().decode()
+        self.assertIn("shared socket fix", text)
+        with opener.open(self.base + f"/ui/p/p1/review/{self.shared}") as response:
+            text = response.read().decode()
+        self.assertIn("Confirm with evidence", text)
+        form = dict(action="historical", expected_revision="1", idempotency_key="ui-review-test")
+        req = urllib.request.Request(
+            self.base + f"/ui/p/p1/review/{self.shared}",
+            urllib.parse.urlencode(form).encode(),
+            method="POST",
+        )
+        with opener.open(req) as response:
+            self.assertIn("Applied", response.read().decode())
+        self.assertEqual(Work(self.s, "p1").record("lead", self.shared)["freshness"], "historical")
+        form = dict(action="historical", selected=self.private + ":1", temporal_kind="durable")
+        req = urllib.request.Request(
+            self.base + "/ui/p/p1/review/bulk", urllib.parse.urlencode(form).encode(), method="POST"
+        )
+        with opener.open(req) as response:
+            self.assertIn("Apply previewed changes", response.read().decode())
+        self.assertEqual(
+            Work(self.s, "p1").record("lead", self.private)["freshness"], "freshness unknown"
+        )

@@ -13,10 +13,10 @@ import threading
 import time
 from typing import Annotated
 
-from fastapi import APIRouter, Body, Depends, Header, Request
+from fastapi import APIRouter, Body, Depends, Header, Request, Response
 from fastapi.responses import JSONResponse
 
-from hub import backup, federation, identity, library
+from hub import backup, federation, identity, library, retrieval
 from hub.common import NotFound
 from hub.identity import IDENT, KEY
 from hub.store import Conflict, Overloaded
@@ -35,6 +35,11 @@ OPERATIONS = {
     "tshoot_proposals": (frozenset({"maintainer"}), False),
     "tshoot_publication_decide": (frozenset({"maintainer"}), True),
     "tshoot_seed_starter": (frozenset({"maintainer"}), True),
+    "memory_claim_get": (frozenset({"reader", "contributor", "maintainer"}), False),
+    "memory_review_list": (frozenset({"reader", "contributor", "maintainer"}), False),
+    "source_check_claim": (frozenset({"connector"}), True),
+    "source_check_complete": (frozenset({"connector"}), True),
+    "source_check_status": (frozenset({"maintainer", "connector"}), False),
     "boot_card": (frozenset({"reader", "contributor", "maintainer"}), False),
     "claim_messages": (CONTRIBUTE, False),
     **{
@@ -51,6 +56,10 @@ OPERATIONS = {
             "send_message",
             "acknowledge",
             "remember",
+            "memory_review",
+            "memory_source_bind",
+            "memory_source_retry",
+            "memory_review_bulk",
             "revise_memory",
             "attempt_record",
             "solution_propose",
@@ -230,14 +239,27 @@ def _post_operation(project_id, operation, request, principal, arguments, idempo
     )
 
 
+def _timed_search(project_id, operation, request, response, principal, arguments):
+    """Server-Timing splits queueing for the one search slot from the search itself."""
+    result = _post_operation(project_id, operation, request, principal, arguments, None)
+    if timing := retrieval.TIMING.get():
+        queue, search = (round(s * 1000, 1) for s in timing)
+        response.headers["Server-Timing"] = f"queue;dur={queue}, search;dur={search}"
+    return result
+
+
 @router.post("/projects/{project_id}/context")
-def context_get(project_id: str, request: Request, principal: Caller, arguments: Json = None):
-    return _post_operation(project_id, "context_get", request, principal, arguments, None)
+def context_get(
+    project_id: str, request: Request, response: Response, principal: Caller, arguments: Json = None
+):
+    return _timed_search(project_id, "context_get", request, response, principal, arguments)
 
 
 @router.post("/projects/{project_id}/tshoot/context")
-def tshoot_context(project_id: str, request: Request, principal: Caller, arguments: Json = None):
-    return _post_operation(project_id, "tshoot_context", request, principal, arguments, None)
+def tshoot_context(
+    project_id: str, request: Request, response: Response, principal: Caller, arguments: Json = None
+):
+    return _timed_search(project_id, "tshoot_context", request, response, principal, arguments)
 
 
 @router.post("/projects/{project_id}/attempts")

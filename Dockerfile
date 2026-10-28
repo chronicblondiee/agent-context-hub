@@ -58,6 +58,13 @@ ENV HUB_SOURCE_REVISION=$SOURCE_REVISION
 LABEL org.opencontainers.image.revision=$SOURCE_REVISION
 USER app
 
+# Optional sequential source checker, API-only with mounted credentials and no database.
+FROM hub-base AS hub-checker
+ARG SOURCE_REVISION=unknown
+LABEL org.opencontainers.image.revision=$SOURCE_REVISION
+USER app
+CMD ["python", "-m", "hub.source_checker"]
+
 # Optional API-only NATS transport. It has no database mount.
 FROM hub-base AS hub-federation
 ARG SOURCE_REVISION=unknown

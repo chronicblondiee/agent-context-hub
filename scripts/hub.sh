@@ -5,6 +5,7 @@
 #        scripts/hub.sh admin STACK METHOD PATH | restore STACK BACKUP_DIR
 #        scripts/hub.sh federation-up STACK PROJECT | federation-down STACK
 #        scripts/hub.sh broker-up|broker-down STACK
+#        scripts/hub.sh checker-up STACK PROJECT | checker-down STACK
 set -euo pipefail
 umask 077
 source_root=$(cd -- "$(dirname -- "$0")/.." && pwd)
@@ -12,6 +13,7 @@ runtime=${HUB_IMAGE:-hub-public-runtime}
 verification=${HUB_VERIFY_IMAGE:-hub-public-verification}
 operator=${HUB_OPERATOR_IMAGE:-hub-public-operator}
 federation=${HUB_FEDERATION_IMAGE:-hub-public-federation}
+checker=${HUB_CHECKER_IMAGE:-hub-public-checker}
 export HUB_VERIFY_IMAGE=$verification
 export HUB_IMAGE=$runtime HUB_UID=$(id -u) HUB_GID=$(id -g) HUB_PORT=${HUB_PORT:-}
 
@@ -23,8 +25,9 @@ stack() {
   compose=(docker compose -p "$project" -f "$source_root/compose.hub.yaml")
   # secrets: the core's read-only mount. admin: the operator's key, never mounted into the core.
   mkdir -p "$HUB_STATE/data" "$HUB_STATE/secrets" "$HUB_STATE/admin" "$HUB_STATE/backups" \
-    "$HUB_STATE/federation-secrets" "$HUB_STATE/nats-data"
-  chmod 700 "$HUB_STATE/secrets" "$HUB_STATE/admin" "$HUB_STATE/federation-secrets"
+    "$HUB_STATE/federation-secrets" "$HUB_STATE/nats-data" "$HUB_STATE/checker-secrets"
+  chmod 700 "$HUB_STATE/secrets" "$HUB_STATE/admin" "$HUB_STATE/federation-secrets" \
+    "$HUB_STATE/checker-secrets"
   exec 9>"$HUB_STATE/.lock"
   flock -x 9
   # The "hub-public-" prefix keeps other Compose projects out of reach; also refuse a hub project another checkout owns.
@@ -275,6 +278,7 @@ case "${1:-}" in
     docker build --target hub-operator -t "$operator" --build-arg SOURCE_REVISION="$revision" \
       "$source_root"
     docker build --target hub-federation -t "$federation" "$source_root"
+    docker build --target hub-checker -t "$checker" "$source_root"
     docker build --target hub-verification -t "$verification" "$source_root"
     docker build --target hub-cli-smoke "$source_root" ;;
   lock)
@@ -304,6 +308,17 @@ case "${1:-}" in
     start
     "${compose[@]}" port core 8097 ;;
   down) stack "${2:-local}"; "${compose[@]}" down ;;
+  checker-up)
+    [[ $# -eq 3 ]] || { echo 'usage: scripts/hub.sh checker-up STACK PROJECT' >&2; exit 2; }
+    stack "$2"
+    [[ "$3" =~ ^[a-z0-9][a-z0-9-]*$ ]] || { echo 'invalid project' >&2; exit 2; }
+    export HUB_CHECK_PROJECT=$3 HUB_CHECKER_IMAGE=$checker
+    [[ -s "$HUB_STATE/checker-secrets/hub.key" && -s "$HUB_STATE/checker-secrets/sources.json" ]] \
+      || { echo 'provision checker-secrets/hub.key and sources.json first' >&2; exit 1; }
+    "${compose[@]}" --profile checker up -d --no-build --wait checker ;;
+  checker-down)
+    stack "$2"
+    "${compose[@]}" --profile checker stop checker ;;
   federation-up)
     [[ $# -eq 3 ]] || { echo 'usage: scripts/hub.sh federation-up STACK PROJECT' >&2; exit 2; }
     stack "$2"

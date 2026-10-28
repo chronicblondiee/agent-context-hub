@@ -148,11 +148,15 @@ class Library:
         environment=None,
         max_chars=8000,
         max_bytes=None,
+        view="all",
     ):
         """This project plus the general library: at most five matches, two of them general."""
         from hub import retrieval
 
         environment = retrieval.validate(query, LIMIT, max_chars, max_bytes, environment)
+        from hub.freshness import eligibility
+
+        eligibility(view)
         if thread_id is not None and not isinstance(thread_id, str):
             raise ValueError("thread_id must be a string")
 
@@ -169,7 +173,7 @@ class Library:
                 ).fetchone():
                     raise ValueError("thread participation required")
             owner = self._owner(db, actor)
-            found, ran = retrieval.ranked(db, self, owner, query, vector, environment)
+            found, ran = retrieval.ranked(db, self, owner, query, vector, environment, view=view)
             for item in found:
                 item.update(project_id=self.project, source="project")
             library, status = library_of(db), "unavailable"
@@ -178,7 +182,7 @@ class Library:
             if library and library != self.project and granted(db, actor, library):
                 shelf = type(self)(self.store, library)
                 general, general_ran = retrieval.ranked(
-                    db, shelf, owner, query, vector, environment, PUBLISHED
+                    db, shelf, owner, query, vector, environment, PUBLISHED, view=view
                 )
                 ran, status = ran and general_ran, "searched"
                 local = {item["id"] for item in found}
@@ -202,7 +206,8 @@ class Library:
                     )
                     found.append(item)
             # Project results win ties on trust, applicability and relevance.
-            found.sort(key=lambda r: (*retrieval.order(r), r["source"] != "project", r["id"]))
+            order, tiebreak = retrieval.order, retrieval.tiebreak
+            found.sort(key=lambda r: (*order(r), r["source"] != "project", *tiebreak(r)))
             selected, bodies, general_count, truncated = [], set(), 0, False
             for item in found:
                 digest = hashlib.sha256(item["summary"].encode()).hexdigest()
@@ -229,7 +234,7 @@ class Library:
                 "matches": matches,
             }
 
-        with retrieval.SEARCHES:
+        with retrieval.searching():
             vector = retrieval.embedded(query)
             return retrieval.fit_context_bytes(self.store.read(search), max_bytes)
 

@@ -269,7 +269,8 @@ def digest(item):
     # Retrieval summaries are cut to fit the budget, so the same record arrives with varying text.
     match = item.get("retrieval")
     if match:
-        item = [match.get(k) for k in ("kind", "id", "revision", "status")]
+        # A reassessment (freshness_revision) is news; text clipping is not.
+        item = [match.get(k) for k in ("kind", "id", "revision", "status", "freshness_revision")]
     return hashlib.sha256(json.dumps(item, sort_keys=True).encode()).hexdigest()[:16]
 
 
@@ -360,9 +361,31 @@ def hook():
         own = os.environ.get("HUB_AGENT_SESSION")
         for match in memory.get("matches", []):
             # This launch wrote it, so it knows it, unless a compact or clear dropped that context.
-            if own and not start and match.get("agent_session") == own:
+            if (
+                own
+                and not start
+                and match.get("agent_session") == own
+                and match.get("freshness_revision", 1) == 1
+            ):
                 continue
-            pointer = {k: match.get(k) for k in ("kind", "id", "revision", "status", "provenance")}
+            pointer = {
+                k: match.get(k)
+                for k in (
+                    "kind",
+                    "id",
+                    "revision",
+                    "status",
+                    "provenance",
+                    "freshness",
+                    "freshness_revision",
+                    "observed_us",
+                    "checked_us",
+                    "source_checked_us",
+                    "review_due_us",
+                    "review_reasons",
+                )
+                if match.get(k) is not None
+            }
             if match.get("hook"):
                 pointer["hook"] = match["hook"]
             pointer["summary"] = clip(match.get("summary", ""))

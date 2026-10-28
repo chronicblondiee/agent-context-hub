@@ -70,7 +70,11 @@ class Memory:
             f"SELECT {COLUMNS} FROM memory_records WHERE project_id = ? AND id = ?",
             [self.project, memory_id],
         ).fetchone()
-        return _record(row) if row else None
+        if not row:
+            return None
+        from hub.freshness import details
+
+        return _record(row) | details(db, self.project, memory_id)
 
     @staticmethod
     def _memory_visible(record, owner):
@@ -89,6 +93,11 @@ class Memory:
         hook="",
         visibility="project",
         supersedes=None,
+        temporal_kind="unclassified",
+        observed_us=None,
+        review_due_us=None,
+        claim_key=None,
+        expected_revision=None,
     ):
         if provenance not in PROVENANCE:
             raise ValueError("every memory record needs a provenance")
@@ -112,6 +121,9 @@ class Memory:
             raise ValueError("namespace or kind exceeds field limit")
         if len(body.encode()) > 262144 or len(hook.encode()) > 480:
             raise ValueError("body or hook exceeds field limit")
+        from hub.freshness import validate
+
+        validate(temporal_kind, observed_us, review_due_us, claim_key)
         ident = str(uuid.uuid4())
 
         def job(tx):
@@ -122,6 +134,23 @@ class Memory:
                 old = self._memory_row(tx, supersedes)
                 if not old or old["owner"] != owner or old["revoked"] or old["superseded_by"]:
                     raise ValueError("revision requires an active record owned by the same human")
+                if expected_revision is not None and old["freshness_revision"] != expected_revision:
+                    from hub.common import Stale
+
+                    raise Stale("freshness revision changed")
+                tx.execute(
+                    "UPDATE memory_freshness SET active=0 WHERE project_id=? AND memory_id=?",
+                    [self.project, supersedes],
+                )
+            if (
+                claim_key
+                and tx.execute(
+                    "SELECT 1 FROM memory_freshness WHERE project_id=? AND owner=? AND namespace=? "
+                    "AND visibility=? AND claim_key=? AND active=1",
+                    [self.project, owner, namespace, visibility, claim_key],
+                ).fetchone()
+            ):
+                raise ValueError("active claim exists; explicitly supersede it")
             tx.execute(
                 f"INSERT INTO memory_records (project_id, {COLUMNS}) VALUES "
                 "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, ?, ?, ?)",
@@ -143,7 +172,18 @@ class Memory:
                     self.agent_session,
                 ],
             )
+            tx.execute(
+                "UPDATE memory_freshness SET temporal_kind=?,observed_us=?,review_due_us=?,"
+                "claim_key=? "
+                "WHERE project_id=? AND memory_id=?",
+                [temporal_kind, observed_us, review_due_us, claim_key, self.project, ident],
+            )
             if supersedes:
+                tx.execute(
+                    "UPDATE memory_source_checks SET state='stopped',generation=generation+1 "
+                    "WHERE project_id=? AND memory_id=?",
+                    [self.project, supersedes],
+                )
                 tx.execute(
                     "UPDATE memory_records SET superseded_by = ? WHERE project_id = ? AND id = ?",
                     [ident, self.project, supersedes],
@@ -163,7 +203,21 @@ class Memory:
 
         return self._mutate(actor, job)
 
-    def revise_memory(self, actor, memory_id, body, provenance, confidence, evidence, hook=""):
+    def revise_memory(
+        self,
+        actor,
+        memory_id,
+        body,
+        provenance,
+        confidence,
+        evidence,
+        hook="",
+        expected_revision=None,
+        temporal_kind=None,
+        observed_us=None,
+        review_due_us=None,
+        claim_key=None,
+    ):
         old = self.store.read(lambda con: self._memory_row(con, memory_id))
         if not old:
             raise ValueError("owned record required")  # remember() checks the owner
@@ -179,7 +233,35 @@ class Memory:
             hook=hook,
             visibility=old["visibility"],
             supersedes=memory_id,
+            expected_revision=expected_revision,
+            temporal_kind=temporal_kind or old["temporal_kind"],
+            observed_us=observed_us,
+            review_due_us=review_due_us if review_due_us is not None else old["review_due_us"],
+            claim_key=claim_key if claim_key is not None else old["claim_key"],
         )
+
+    def _revoke(self, tx, memory_id):
+        """Revocation effects shared by revoke_memory and freshness retirement."""
+        tx.execute(
+            "UPDATE memory_records SET revoked = 1 WHERE project_id = ? AND id = ?",
+            [self.project, memory_id],
+        )
+        tx.execute(
+            "UPDATE memory_freshness SET active=0 WHERE project_id=? AND memory_id=?",
+            [self.project, memory_id],
+        )
+        tx.execute(
+            "UPDATE memory_source_checks SET state='stopped',generation=generation+1 "
+            "WHERE project_id=? AND memory_id=?",
+            [self.project, memory_id],
+        )
+        deindex(tx, "memory", memory_id)
+        withdraw(tx, self.project, memory_id)
+        from hub import federation
+
+        federation.changed(tx, memory_id)
+        tx.audit("revoke", memory_id, {})
+        tx.change("revoke", memory_id, {})
 
     def revoke_memory(self, actor, memory_id, maintainer=False):
         """Owners revoke their records; maintainers also revoke project-visible ones."""
@@ -193,17 +275,7 @@ class Memory:
             if not allowed:
                 raise ValueError("owned record required")
             if not record["revoked"]:
-                tx.execute(
-                    "UPDATE memory_records SET revoked = 1 WHERE project_id = ? AND id = ?",
-                    [self.project, memory_id],
-                )
-                deindex(tx, "memory", memory_id)
-                withdraw(tx, self.project, memory_id)
-                from hub import federation
-
-                federation.changed(tx, memory_id)
-                tx.audit("revoke", memory_id, {})
-                tx.change("revoke", memory_id, {})
+                self._revoke(tx, memory_id)
             return {"revoked": memory_id}
 
         return self._mutate(actor, job)
@@ -232,11 +304,19 @@ class Memory:
             [self.project, self._owner(db, actor)],
         )
         seen, out = {}, []
-        for row in rows:
+        from hub.freshness import details
+
+        rows = [(row, details(db, self.project, row[0])) for row in rows]
+        rows.sort(key=lambda pair: pair[1]["freshness"] != "current")
+        for row, fresh in rows:
+            if not disclosable(db, self.project, row[0], actor=actor):
+                continue
+            if fresh["freshness"] not in ("current", "freshness unknown"):
+                continue
             if seen.get(row[1], 0) >= PER_NAMESPACE:
                 continue
             seen[row[1]] = seen.get(row[1], 0) + 1
-            out.append(" ".join(str(part) for part in row))
+            out.append(" ".join(str(part) for part in [*row, fresh["freshness"]]))
             if len(out) >= CARD_LIMIT:
                 break
         return out[::-1]

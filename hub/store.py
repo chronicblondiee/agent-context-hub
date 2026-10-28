@@ -133,6 +133,7 @@ class Store:
                 f"database schema {version}, code expects {SCHEMA_VERSION}; run hub migrate"
             )
         self._local, self._readers = threading.local(), []
+        self._write_stats = {"wait_seconds": 0.0, "transaction_seconds": 0.0, "transactions": 0}
         self._jobs = queue.Queue(queue_size)
         self._writer = threading.Thread(
             target=self._run, args=(writer,), name="hub-writer", daemon=True
@@ -141,11 +142,15 @@ class Store:
 
     def _run(self, con):
         while (job := self._jobs.get()) is not None:
-            fn, future = job
+            fn, future, queued = job
+            started = time.monotonic()
+            self._write_stats["wait_seconds"] += started - queued
             try:
                 con.execute("BEGIN IMMEDIATE")
                 result = fn(con)
                 con.execute("COMMIT")
+                self._write_stats["transaction_seconds"] += time.monotonic() - started
+                self._write_stats["transactions"] += 1
                 future.set_result(result)
             except BaseException as error:
                 if con.in_transaction:
@@ -153,12 +158,15 @@ class Store:
                 future.set_exception(error)
         con.close()
 
+    def write_metrics(self):
+        return {**self._write_stats, "queue_depth": self._jobs.qsize()}
+
     def _submit(self, fn):
         if threading.current_thread() is self._writer:
             raise RuntimeError("nested write would deadlock the writer thread")
         future = Future()
         try:
-            self._jobs.put_nowait((fn, future))
+            self._jobs.put_nowait((fn, future, time.monotonic()))
         except queue.Full:
             raise Overloaded("write queue full") from None
         return future.result()

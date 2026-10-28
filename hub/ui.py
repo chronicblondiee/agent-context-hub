@@ -88,6 +88,7 @@ TABS = (
     ("/activity", "Activity"),
     ("/attempts", "Attempts"),
     ("/search", "Search"),
+    ("/review", "Memory review"),
     ("/threads", "Investigations"),
     ("/proposals", "Library proposals"),
 )
@@ -485,7 +486,7 @@ def search_page(project: str, request: Request, q: str = ""):
                     [
                         m["kind"],
                         target(m),
-                        m["status"],
+                        m["status"] + " / " + m.get("freshness", "current"),
                         m.get("provenance", ""),
                         m.get("author", ""),
                         ", ".join(m["reasons"]),
@@ -538,6 +539,10 @@ def record_page(project: str, record_id: str, request: Request):
         )
     ]
     fields.append(["created", when(row["created_us"])])
+    from hub.freshness import details
+
+    temporal = read(request, lambda db: details(db, project, record_id))
+    fields.extend([[key, json.dumps(value)] for key, value in temporal.items()])
     return page(
         "record",
         title=record_id,
@@ -812,4 +817,360 @@ def proposals_page(project: str, request: Request, cursor: int = 0):
             "Published memories are unverified leads; solution copies need their own "
             "evidence or approval.</p>" + content
         ),
+    )
+
+
+@router.get("/p/{project}/review", response_class=HTMLResponse)
+def memory_review_page(project: str, request: Request, reason: str = "", after: str = ""):
+    principal = thread_reader(request, project)
+    records = api.call(
+        request.app.state.store,
+        principal,
+        project,
+        "memory_review_list",
+        {"reason": reason or None, "after": after},
+    )
+    rows = []
+    for record in records:
+        ident = html.escape(record["id"])
+        revision = record["freshness_revision"]
+        selection = Raw(f'<input type="checkbox" name="selected" value="{ident}:{revision}">')
+        rows.append(
+            [
+                selection,
+                link(f"/ui/p/{quote(project)}/review/{ident}", record["hook"]),
+                record["freshness"],
+                ", ".join(record["review_reasons"]),
+                when(record["observed_us"]),
+                when(record["checked_us"]),
+                when(record["review_due_us"]),
+                when(record["reminder_us"]),
+            ]
+        )
+    body = Raw(
+        f'<form method="post" action="/ui/p/{quote(project)}/review/bulk">'
+        + table(
+            [
+                "Select",
+                "Claim",
+                "Freshness",
+                "Review reason",
+                "Observed",
+                "Confirmed",
+                "Due",
+                "Reminder",
+            ],
+            rows,
+        )
+        + '<select name="action"><option '
+        'value="classify">Classify</option><option value="historical">Historical</option>'
+        '<option value="defer">Defer</option></select> '
+        "<select "
+        'name="temporal_kind"><option>durable</option><option>historical</option>'
+        "<option>unclassified</option></select> "
+        '<input name="reminder_us" type="datetime-local" aria-label="Reminder (UTC)"> '
+        "<button>Preview selected changes</button></form>"
+    )
+    if len(records) == 100:
+        body += link(
+            f"/ui/p/{quote(project)}/review?after={quote(records[-1]['id'])}&reason={quote(reason)}",
+            "Next page",
+        )
+    return page(
+        "review",
+        title="Memory review",
+        project=project,
+        tabs=tabs(project, "Memory review"),
+        body=body,
+    )
+
+
+@router.post("/p/{project}/review/bulk", response_class=HTMLResponse)
+async def memory_review_bulk_page(project: str, request: Request):
+    principal = thread_reader(request, project)
+    if cross_site(request):
+        raise HTTPException(403, "cross-site request")
+    form = await request.form()
+    try:
+        if form.get("payload"):
+            arguments = json.loads(form["payload"])
+            arguments.update(preview=False, preview_token=form["preview_token"])
+        else:
+            records = []
+            for value in form.getlist("selected"):
+                ident, revision = value.rsplit(":", 1)
+                records.append(dict(memory_id=ident, expected_revision=int(revision)))
+            arguments = dict(
+                records=records,
+                action=form["action"],
+                temporal_kind=form.get("temporal_kind"),
+                reminder_us=review_date(form.get("reminder_us")),
+                preview=True,
+            )
+        result = api.call(
+            request.app.state.store,
+            principal,
+            project,
+            "memory_review_bulk",
+            arguments,
+            form.get("idempotency_key") or f"ui-{uuid.uuid4()}",
+        )
+        body = table(
+            ["Claim", "Revision", "Current freshness"],
+            [[r["body"], r["freshness_revision"], r["freshness"]] for r in result["records"]],
+        )
+        if result["preview"]:
+            body = Raw(
+                f"<p>Proposed action: {html.escape(arguments['action'])}; classification: "
+                f"{html.escape(str(arguments.get('temporal_kind')))}"
+                f"; reminder: {arguments.get('reminder_us')}</p>"
+                + body
+                + '<form method="post"><input type="hidden" name="payload" value="'
+                + html.escape(json.dumps(arguments), quote=True)
+                + '"><input type="hidden" name="preview_token" value="'
+                + result["preview_token"]
+                + '"><input type="hidden" name="idempotency_key" value="'
+                + str(uuid.uuid4())
+                + '"><button>Apply previewed changes</button></form>'
+            )
+        else:
+            body = Raw("<p>Changes applied.</p>" + body)
+    except (ValueError, KeyError) as error:
+        body = html.escape(str(error))
+    return page(
+        "review",
+        title="Review preview",
+        project=project,
+        tabs=tabs(project, "Memory review"),
+        body=body,
+    )
+
+
+@router.get("/p/{project}/review/{memory_id}", response_class=HTMLResponse)
+def memory_review_detail(project: str, memory_id: str, request: Request):
+    principal = thread_reader(request, project)
+    api.authorize(principal, project, api.OPERATIONS["memory_review_list"][0])
+    from hub.work import Work
+
+    work = Work(request.app.state.store, project)
+    record = work.record(principal.id, memory_id)
+    if not record:
+        raise HTTPException(404, "not found")
+
+    def related(db):
+        return (
+            [
+                dict(r)
+                for r in db.execute(
+                    "SELECT id,source,baseline,observed_fingerprint,state,failure,checked_us "
+                    "FROM memory_source_checks WHERE project_id=? AND memory_id=?",
+                    [project, memory_id],
+                )
+            ],
+            [
+                r[0]
+                for r in db.execute(
+                    "SELECT id FROM memory_records WHERE project_id=? AND superseded_by=?",
+                    [project, memory_id],
+                )
+            ],
+        )
+
+    sources, previous = work.store.read(related)
+    body = Raw(
+        "<pre>"
+        + html.escape(record["body"])
+        + "</pre>"
+        + table(
+            ["Field", "Value"],
+            [
+                [k, json.dumps(v, ensure_ascii=False)]
+                for k, v in record.items()
+                if k not in ("body", "hook")
+            ],
+        )
+        + "<h2>Sources</h2><pre>"
+        + html.escape(json.dumps(sources, indent=2))
+        + "</pre>"
+        + "<h2>Replacement history</h2>"
+        + " ".join(
+            str(link(f"/ui/p/{quote(project)}/review/{quote(i)}", i))
+            for i in previous + ([record["superseded_by"]] if record["superseded_by"] else [])
+        )
+    )
+
+    def input_field(name, label, value="", kind="text"):
+        return (
+            f'<label>{html.escape(label)} <input name="{name}" type="{kind}" '
+            f'value="{html.escape(str(value or ""), quote=True)}"></label><br>'
+        )
+
+    def utc_value(value):
+        return (
+            datetime.datetime.fromtimestamp(value / 1e6, datetime.UTC).strftime("%Y-%m-%dT%H:%M")
+            if value
+            else ""
+        )
+
+    hidden = input_field(
+        "expected_revision", "", record["freshness_revision"], "hidden"
+    ) + input_field("idempotency_key", "", str(uuid.uuid4()), "hidden")
+    body += Raw(
+        '<form method="post">' + hidden + '<label>Action <select name="action">'
+        '<option value="confirm">Confirm with evidence</option>'
+        '<option value="edit">Edit and supersede</option>'
+        '<option value="classify">Classify</option>'
+        '<option value="historical">Classify as historical</option>'
+        '<option value="retire">Retire</option><option value="defer">Defer reminder</option>'
+        '<option value="conflict">Flag conflicting evidence</option></select></label><br>'
+        '<label>Classification <select name="temporal_kind">'
+        + "".join(
+            f'<option value="{key}" {"selected" if key == record["temporal_kind"] else ""}'
+            f">{label}</option>"
+            for key, label in [
+                ("unclassified", "Unassessed"),
+                ("durable", "Durable knowledge"),
+                ("changing", "Changing state"),
+                ("historical", "Historical observation"),
+            ]
+        )
+        + "</select></label><br>"
+        + input_field("claim_key", "Claim key (changing state)", record["claim_key"])
+        + input_field(
+            "observed", "Observed (UTC)", utc_value(record["observed_us"]), "datetime-local"
+        )
+        + input_field(
+            "review_due",
+            "Review deadline (UTC)",
+            utc_value(record["review_due_us"]),
+            "datetime-local",
+        )
+        + input_field(
+            "reminder", "Reminder (UTC)", utc_value(record["reminder_us"]), "datetime-local"
+        )
+        + "<label>Evidence references, one per line"
+        '<textarea name="evidence" rows="3" style="width:100%">'
+        + html.escape("\n".join(record["evidence"]))
+        + "</textarea></label>"
+        + "<label>Corrected claim (edit) or proposed correction (conflict)"
+        '<textarea name="body" rows="8" style="width:100%">'
+        + html.escape(record["proposed_correction"] or record["body"])
+        + "</textarea></label>"
+        + "<button>Apply review</button></form>"
+    )
+    endpoints = json.loads(os.environ.get("HUB_CHECK_ENDPOINTS", "[]"))
+    body += Raw(
+        '<h2>Schedule a source check</h2><form method="post">'
+        + hidden
+        + '<input type="hidden" name="action" value="bind">'
+        '<label>Configured endpoint <select name="endpoint">'
+        + "".join(f"<option>{html.escape(e)}</option>" for e in endpoints)
+        + "</select></label><br>"
+        + input_field("repository", "Repository (owner/name)")
+        + '<label>Source <select name="source_kind"><option value="file">Repository file</option>'
+        '<option value="issue">Issue</option>'
+        '<option value="pull">Pull request</option></select></label><br>'
+        + input_field("ref", "Branch or tag", "main")
+        + input_field("path", "File path")
+        + input_field("number", "Issue or pull request number", kind="number")
+        + input_field("baseline", "Baseline SHA-256 (optional; blank adopts the first check)")
+        + "<button>Bind source and schedule</button></form>"
+    )
+    for source in sources:
+        body += Raw(
+            '<form method="post">'
+            + hidden
+            + input_field("action", "", "retry", "hidden")
+            + input_field("job_id", "", source["id"], "hidden")
+            + "<p>Retry source "
+            + html.escape(source["id"])
+            + "</p>"
+            + input_field("baseline", "Replacement baseline (optional)")
+            + "<button>Retry source check</button></form>"
+        )
+    return page(
+        "review",
+        title="Review claim",
+        project=project,
+        tabs=tabs(project, "Memory review"),
+        body=body,
+    )
+
+
+def review_date(value):
+    if not value:
+        return None
+    return int(
+        datetime.datetime.fromisoformat(value).replace(tzinfo=datetime.UTC).timestamp() * 1e6
+    )
+
+
+@router.post("/p/{project}/review/{memory_id}", response_class=HTMLResponse)
+async def memory_review_apply(project: str, memory_id: str, request: Request):
+    principal = thread_reader(request, project)
+    if cross_site(request):
+        raise HTTPException(403, "cross-site request")
+    form = await request.form()
+    try:
+        action = form["action"]
+        args = dict(memory_id=memory_id, expected_revision=int(form["expected_revision"]))
+        if action in ("bind", "retry"):
+            if action == "bind":
+                source = dict(
+                    endpoint=form["endpoint"],
+                    repository=form["repository"],
+                    kind=form["source_kind"],
+                )
+                if source["kind"] == "file":
+                    source.update(ref=form["ref"], path=form["path"])
+                else:
+                    source["number"] = int(form["number"])
+                args.update(source=source, baseline=form.get("baseline") or None)
+                operation = "memory_source_bind"
+            else:
+                args.pop("memory_id")
+                args.update(job_id=form["job_id"], baseline=form.get("baseline") or None)
+                operation = "memory_source_retry"
+        else:
+            args.update(
+                temporal_kind=form.get("temporal_kind"),
+                claim_key=form.get("claim_key") or None,
+                observed_us=review_date(form.get("observed")),
+                review_due_us=review_date(form.get("review_due")),
+                evidence=[e.strip() for e in form.get("evidence", "").splitlines() if e.strip()],
+            )
+            if action == "edit":
+                from hub.work import Work
+
+                old = Work(request.app.state.store, project).record(principal.id, memory_id)
+                if not old:
+                    raise ValueError("record unavailable")
+                args.update(
+                    body=form["body"], provenance=old["provenance"], confidence=old["confidence"]
+                )
+                operation = "revise_memory"
+            else:
+                args.update(
+                    action=action,
+                    reminder_us=review_date(form.get("reminder")),
+                    proposed_correction=form.get("body") if action == "conflict" else None,
+                )
+                operation = "memory_review"
+        api.call(
+            request.app.state.store, principal, project, operation, args, form["idempotency_key"]
+        )
+        body = Raw(
+            "<p>Applied.</p>"
+            + link(f"/ui/p/{quote(project)}/review/{quote(memory_id)}", "Read updated record")
+        )
+    except (*api.HANDLED, KeyError) as error:
+        body = "Refused: " + (
+            api.classify(error)[1] if not isinstance(error, KeyError) else "missing field"
+        )
+    return page(
+        "review",
+        title="Memory review",
+        project=project,
+        tabs=tabs(project, "Memory review"),
+        body=body,
     )

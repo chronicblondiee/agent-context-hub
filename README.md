@@ -79,6 +79,16 @@ are opt-in during setup; `HUB_DISABLED=1` or `HUB_NO_MEMORY=1` disables helper m
 activity. Use a distinct `--session SESSION` for each terminal investigation.
 `hub --help` lists commands.
 
+Memory records carry a freshness assessment separate from trust: durable, changing
+(with a claim key and review deadline), historical or unclassified. Default context
+shows current knowledge first and labels unclassified records; `view=history|all`
+shows the rest. The web UI's Memory review tab confirms, corrects, defers or retires
+records. An optional API-only `hub-checker` container (`scripts/hub.sh checker-up STACK
+PROJECT`) watches files, issues and pull requests on a Gitea-compatible forge and
+flags changed sources for review. It needs a project connector key in
+`checker-secrets/hub.key`, endpoint names in the core's `HUB_CHECK_ENDPOINTS`, and
+`checker-secrets/sources.json` mapping each name to `url` and `token_file`.
+
 Troubleshooting is kept apart from the general task and memory workflow. `hub setup
 --client claude|codex` also installs a personal, explicit-only skill: `/tshoot <problem>`
 in Claude Code, `$tshoot <problem>` in Codex. Neither client loads it, or the
